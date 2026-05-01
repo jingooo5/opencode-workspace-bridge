@@ -1,6 +1,3 @@
-import type { Config } from "@opencode-ai/plugin";
-import type { ContextBridgeOptions } from "../types.js";
-
 export const DEFAULT_CONTEXT_BRIDGE_AGENT = "ctx-orchestrator";
 
 export interface AgentInstallSpec {
@@ -13,46 +10,16 @@ export interface AgentInstallSpec {
   permission: Record<string, unknown>;
 }
 
-export function injectContextBridgeAgents(config: Config, options?: Pick<ContextBridgeOptions, "autoDefaultAgent" | "defaultAgentName">): void {
-  const defaultAgent = options?.defaultAgentName ?? DEFAULT_CONTEXT_BRIDGE_AGENT;
-  const mutable = config as Config & {
-    agent?: Record<string, unknown>;
-    command?: Record<string, unknown>;
-    default_agent?: string;
-  };
-  mutable.agent ??= {};
-
-  for (const spec of getContextBridgeAgentSpecs(defaultAgent)) {
-    mutable.agent[spec.name] = toConfigAgent(spec);
-  }
-
-  if (options?.autoDefaultAgent !== false) {
-    mutable.default_agent = defaultAgent;
-  }
-
-  mutable.command ??= {};
-  mutable.command["ctx-list"] = {
-    description: "List Context Bridge workspace roots",
-    template: "Call the ctx_list_roots tool and explain any stale roots or read-only roots.",
-    agent: defaultAgent,
-  };
-  mutable.command["ctx-pack"] = {
-    description: "Create a Context Bridge task pack",
-    template: "Create a context pack for this task using ctx_pack: $ARGUMENTS",
-    agent: defaultAgent,
-  };
-  mutable.command["ctx-impact"] = {
-    description: "Analyze cross-root impact",
-    template: "Use ctx-impact-analyst. Analyze cross-root impact for: $ARGUMENTS. Use ctx_search and ctx_pack if needed.",
-    agent: defaultAgent,
-  };
-}
-
-export function getContextBridgeAgentSpecs(defaultAgentName = DEFAULT_CONTEXT_BRIDGE_AGENT): AgentInstallSpec[] {
+// This module is the source of truth for Context Bridge agent specs and the
+// markdown emitted for OpenCode's agent files.
+export function getContextBridgeAgentSpecs(
+  defaultAgentName = DEFAULT_CONTEXT_BRIDGE_AGENT,
+): AgentInstallSpec[] {
   return [
     {
       name: defaultAgentName,
-      description: "Primary Context Bridge orchestrator for multi-root, cross-repository, DTO/API, and service-boundary tasks.",
+      description:
+        "Primary Context Bridge orchestrator for multi-root, cross-repository, DTO/API, and service-boundary tasks.",
       mode: "primary",
       prompt: CONTEXT_ORCHESTRATOR_PROMPT,
       permission: {
@@ -71,7 +38,8 @@ export function getContextBridgeAgentSpecs(defaultAgentName = DEFAULT_CONTEXT_BR
     },
     {
       name: "ctx-workspace-architect",
-      description: "Use automatically when a task needs repository/workspace discovery, root aliasing, package structure, or multi-root project mapping.",
+      description:
+        "Use automatically when a task needs repository/workspace discovery, root aliasing, package structure, or multi-root project mapping.",
       mode: "subagent",
       hidden: true,
       prompt: WORKSPACE_ARCHITECT_PROMPT,
@@ -80,7 +48,8 @@ export function getContextBridgeAgentSpecs(defaultAgentName = DEFAULT_CONTEXT_BR
     },
     {
       name: "ctx-context-curator",
-      description: "Use automatically before cross-repo implementation to build a minimal evidence-backed context pack with relevant roots, files, symbols, contracts, and tests.",
+      description:
+        "Use automatically before cross-repo implementation to build a minimal evidence-backed context pack with relevant roots, files, symbols, contracts, and tests.",
       mode: "subagent",
       hidden: true,
       prompt: CONTEXT_CURATOR_PROMPT,
@@ -89,7 +58,8 @@ export function getContextBridgeAgentSpecs(defaultAgentName = DEFAULT_CONTEXT_BR
     },
     {
       name: "ctx-impact-analyst",
-      description: "Use automatically when a change may affect shared DTOs, schemas, APIs, gRPC/proto, cache keys, message topics, database migrations, or multiple workspaces.",
+      description:
+        "Use automatically when a change may affect shared DTOs, schemas, APIs, gRPC/proto, cache keys, message topics, database migrations, or multiple workspaces.",
       mode: "subagent",
       hidden: true,
       prompt: IMPACT_ANALYST_PROMPT,
@@ -98,7 +68,8 @@ export function getContextBridgeAgentSpecs(defaultAgentName = DEFAULT_CONTEXT_BR
     },
     {
       name: "ctx-test-router",
-      description: "Use automatically after edits or before validation to select targeted tests/build commands for affected roots without running a full suite unnecessarily.",
+      description:
+        "Use automatically after edits or before validation to select targeted tests/build commands for affected roots without running a full suite unnecessarily.",
       mode: "subagent",
       hidden: true,
       prompt: TEST_ROUTER_PROMPT,
@@ -127,31 +98,26 @@ export function getContextBridgeAgentSpecs(defaultAgentName = DEFAULT_CONTEXT_BR
   ];
 }
 
+// Render one spec into the frontmatter + prompt body format OpenCode expects.
 export function agentMarkdown(spec: AgentInstallSpec): string {
   const frontmatter = [
     "---",
     `description: ${yamlString(spec.description)}`,
     `mode: ${spec.mode}`,
     spec.hidden ? "hidden: true" : undefined,
-    spec.temperature === undefined ? undefined : `temperature: ${spec.temperature}`,
+    spec.temperature === undefined
+      ? undefined
+      : `temperature: ${spec.temperature}`,
     "permission:",
     yamlPermission(spec.permission, 1),
     "---",
-  ].filter(Boolean).join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
   return `${frontmatter}\n${spec.prompt.trim()}\n`;
 }
 
-function toConfigAgent(spec: AgentInstallSpec): Record<string, unknown> {
-  return {
-    description: spec.description,
-    mode: spec.mode,
-    hidden: spec.hidden,
-    prompt: spec.prompt,
-    temperature: spec.temperature,
-    permission: spec.permission,
-  };
-}
-
+// Keep the read-only permission shape in one place so subagent specs stay aligned.
 function readOnlyPermission() {
   return {
     read: "allow",
@@ -172,14 +138,17 @@ function readOnlyPermission() {
   };
 }
 
+// JSON.stringify preserves quoting/escaping for YAML string scalars here.
 function yamlString(value: string): string {
   return JSON.stringify(value);
 }
 
+// Minimal YAML emitter for nested permission maps; avoids adding a dependency.
 function yamlPermission(value: unknown, depth: number): string {
   const indent = "  ".repeat(depth);
   if (typeof value === "string") return `${indent}${value}`;
-  if (typeof value !== "object" || value === null) return `${indent}${JSON.stringify(value)}`;
+  if (typeof value !== "object" || value === null)
+    return `${indent}${JSON.stringify(value)}`;
   return Object.entries(value as Record<string, unknown>)
     .map(([key, nested]) => {
       if (typeof nested === "string") return `${indent}${key}: ${nested}`;
