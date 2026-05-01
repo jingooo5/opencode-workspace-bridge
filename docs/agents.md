@@ -1,182 +1,219 @@
 # agents.md
 
-이 문서는 `opencode-context-bridge` 플러그인이 OpenCode에 주입하는 에이전트들의 역할, 권한, 그리고 실제 사용 흐름을 정리한다. 모든 에이전트 정의의 단일 출처는 `src/agents/agent-configs.ts`이며, 본 문서는 그 코드와 동기화된 설명이다.
+이 문서는 `opencode-context-bridge`가 OpenCode 런타임에 주입하는 에이전트, 명령, 도구, 자동 라우팅 흐름을 정리한다. 기준 코드는 `src/agents/agent-configs.ts`, `src/agents/agent-install.ts`, `src/commands/command-configs.ts`, `src/tools/context-tools.ts`, `src/plugin-interface.ts`, `src/hooks/auto-router.ts`다.
 
----
+## 1. 런타임 주입 구조
 
-## 1. 에이전트 주입 경로
+에이전트 주입과 명령 주입은 분리되어 있다.
 
-에이전트는 두 가지 경로로 OpenCode에 노출된다.
+1. 에이전트 주입  
+   `src/agents/agent-install.ts`의 `injectContextBridgeAgents`가 `Config.agent`에 Context Bridge 에이전트를 등록한다. `autoDefaultAgent`가 꺼져 있지 않으면 `Config.default_agent`도 기본 primary 에이전트로 설정한다. 이 함수는 명령을 등록하지 않는다.
 
-1. **런타임 주입 (`config` 훅)**
-   `plugin-interface.ts`의 `config` 훅이 매 세션마다 `injectContextBridgeAgents`를 호출한다. 이 함수는 `Config.agent`에 다섯 에이전트를 등록하고, 옵션이 켜져 있으면 `Config.default_agent`를 `ctx-orchestrator`로 지정하며, `ctx-list`/`ctx-pack`/`ctx-impact` 슬래시 명령을 `Config.command`에 추가한다. 이 경로는 플러그인이 로드되어 있는 한 항상 동작하므로, 사용자가 글로벌 마크다운 파일을 수동으로 관리할 필요가 없다.
+2. 명령 주입  
+   `src/commands/command-configs.ts`의 `injectContextBridgeCommands`가 `Config.command`에 runtime command를 등록한다. 명령별로 담당 에이전트와 `subtask` 여부를 지정한다.
 
-2. **글로벌 마크다운 파일 (옵션)**
-   `globalBootstrap` + `globalInstallAgents` 옵션이 켜져 있거나 사용자가 `npx opencode-context-bridge install`을 실행하면, `agentMarkdown(spec)`이 같은 스펙을 마크다운 frontmatter로 직렬화해 `~/.config/opencode/agents/<name>.md`에 기록한다. 이는 OpenCode가 플러그인 없이도 에이전트를 인식할 수 있도록 하는 백업 경로다.
+3. 플러그인 연결  
+   `src/plugin-interface.ts`의 `config` 훅은 `options.autoAgents`가 켜져 있을 때 `injectContextBridgeAgents`와 `injectContextBridgeCommands`를 둘 다 호출한다. 따라서 `autoAgents`는 에이전트와 명령의 런타임 주입을 함께 켜는 옵션이다.
 
-`getContextBridgeAgentSpecs(defaultAgentName)` 한 번이 두 경로의 진실의 출처(single source of truth)를 형성한다. 따라서 에이전트 변경은 `agent-configs.ts` 한 곳만 수정하면 된다.
-
----
+에이전트 스펙의 단일 출처는 `getContextBridgeAgentSpecs`다. 명령 스펙의 단일 출처는 `getContextBridgeCommandSpecs`다.
 
 ## 2. 에이전트 목록
 
-다섯 에이전트가 정의되어 있다. 모두 같은 OpenCode 권한 모델을 따른다(`read`/`grep`/`glob`/`list`/`edit`/`bash`/`external_directory`/`task`).
+현재 에이전트는 모두 8개다. 기본 primary 이름은 `ctx-orchestrator`이며 `defaultAgentName` 옵션으로 바꿀 수 있다. 나머지 7개는 hidden subagent로 등록된다. 모든 에이전트의 `temperature`는 `0.1`이다.
 
-| 이름                      | 모드       | hidden | 기본 권한 요약                                                                                                          |
-| ------------------------- | ---------- | ------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `ctx-orchestrator`        | `primary`  | no     | read/grep/glob/list allow, edit/bash/external_directory ask, task는 `ctx-*`만 allow                                     |
-| `ctx-workspace-architect` | `subagent` | yes    | 읽기 전용. bash는 `git status*`, `git diff*`, `rg *`, `grep *`, `find *`, `ls *`만 allow                                |
-| `ctx-context-curator`     | `subagent` | yes    | 읽기 전용. bash는 deny + 위 화이트리스트                                                                                |
-| `ctx-impact-analyst`      | `subagent` | yes    | 읽기 전용. bash는 deny + 위 화이트리스트                                                                                |
-| `ctx-test-router`         | `subagent` | yes    | 읽기 전용 + 테스트 명령 ask: `npm test*`, `pnpm test*`, `bun test*`, `yarn test*`, `pytest*`, `go test*`, `cargo test*` |
+| 이름 | 모드 / 노출 | 역할 요약 | 권한 요약 |
+| --- | --- | --- | --- |
+| `ctx-orchestrator` | `primary` / visible | `/ctx-*` 명령과 cross-repository 작업을 조율하는 parent agent | read/grep/glob/list/lsp allow, edit deny, bash ask, task allow, external_directory ask |
+| `ctx-workspace-architect` | `subagent` / hidden | 루트, 패키지, 언어, 서비스, 모듈, 경계 구조 탐색 | read-only 기본, bash는 ask 기본 + `git *`, `pwd`, `ls *`, `find *` allow, lsp allow |
+| `ctx-context-curator` | `subagent` / hidden | 작업별 최소 evidence-backed context pack 구성 | read-only 기본, `.opencode/context-bridge/packs/**`만 edit allow, bash deny, lsp allow |
+| `ctx-impact-analyst` | `subagent` / hidden | 파일, 심볼, DTO, endpoint, contract 영향 분석 | read-only 기본, bash deny, external_directory ask, lsp allow |
+| `ctx-semantic-summarizer` | `subagent` / hidden | 증거 기반 semantic summary / memory 작성 | read-only 기본, `.opencode/context-bridge/memory/**`와 `packs/**`만 edit allow, bash deny |
+| `ctx-test-router` | `subagent` / hidden | 테스트와 validation command 후보 선정 | read/grep/glob/list allow, edit deny, bash ask, external_directory ask |
+| `ctx-validation-runner` | `subagent` / hidden | 승인된 validation plan 실행과 실패 매핑 | read/grep/glob/list allow, edit deny, 테스트 계열 bash allowlist, external_directory ask |
+| `ctx-builder` | `subagent` / hidden | 승인된 context pack과 impact report 기반 구현 | read/grep/glob/list/lsp allow, edit ask, bash ask, external_directory ask |
 
-`ctx-orchestrator`만 `mode: primary`이며 사용자 메시지를 직접 받는다. 나머지는 hidden subagent로 OpenCode의 Task 도구를 통해서만 호출된다. `ctx-orchestrator`의 `task` 권한은 `"*": "deny", "ctx-*": "allow"`이므로, primary가 자기 패밀리 외 임의의 에이전트를 위임 호출할 수 없게 잠겨 있다.
+주의할 점은 모든 subagent가 읽기 전용은 아니라는 것이다. `ctx-builder`는 구현을 위해 편집을 요청할 수 있고, `ctx-context-curator`와 `ctx-semantic-summarizer`는 지정된 Context Bridge 상태 디렉터리 아래에만 쓸 수 있다.
 
-### 2.1 ctx-orchestrator (primary)
+### 2.1 `ctx-orchestrator`
 
-**역할.** Context Bridge의 기본 primary 에이전트. 멀티 루트, cross-repository, DTO/API, 서비스 경계 작업을 받았을 때 다음을 수행하도록 프롬프트가 작성되어 있다.
+기본 primary 에이전트다. 다중 루트 작업, 외부 루트 추가, 컨텍스트 팩 생성, 영향 분석, 구현 위임, 검증 위임을 조율한다. 루트 상태가 불명확하면 `ctx_status` 또는 `ctx_list_roots`로 시작하고, 변경 작업은 `ctx_pack`과 필요 시 `ctx-impact-analyst`를 거친 뒤 `ctx-builder`에 넘기는 흐름을 따른다.
 
-- 루트 상태가 불명확하면 `ctx_list_roots`로 매니페스트를 확인.
-- 광범위한 cross-root 구현 전에는 `ctx_pack`을 먼저 호출.
-- 작업이 넓으면 `ctx-context-curator`에게 컨텍스트 최소화를 위임.
-- 공유 DTO/계약/스키마 또는 cross-root 의존을 편집하기 전에 `ctx-impact-analyst`에 위임.
-- 편집 후에는 `ctx-test-router`에 위임해 타깃 검증을 선택.
-- 단일 파일/단일 루트 작업처럼 위험 신호가 없으면 OpenCode의 기본 동작을 그대로 사용.
+권한상 프로젝트 소스 편집은 `deny`다. 따라서 직접 수정자가 아니라 parent orchestrator 역할을 맡는다. `task: allow`이므로 필요한 hidden subagent에게 위임할 수 있다.
 
-**프롬프트 핵심 지침.** evidence가 없는 시맨틱 요약을 신뢰하지 않는다. 단순 작업에서는 위 위임 절차를 강제하지 않고, 멀티 루트나 경계 위험이 있을 때만 단계를 추가한다.
+### 2.2 `ctx-workspace-architect`
 
-### 2.2 ctx-workspace-architect (hidden subagent)
+읽기 중심의 워크스페이스 구조 탐색 subagent다. 루트의 역할, 패키지와 빌드 단서, 언어와 프레임워크, 서비스 경계, provider/consumer 관계, DTO/schema/shared model 후보를 정리한다.
 
-**역할.** 워크스페이스 루트, 패키지, 모듈, 서비스 경계의 지도화. 루트의 역할 추정, 패키지/빌드 메타데이터 단서, 가능한 provider/consumer 관계, unknown, 그리고 다음에 호출하면 좋은 `ctx_add_dir`/`ctx_index` 액션을 반환한다.
+주요 도구는 `ctx_list_roots`, `ctx_status`, `ctx_search`, `ctx_symbols`, `ctx_neighbors`, `ctx_read`다. bash는 기본적으로 ask지만 `git *`, `pwd`, `ls *`, `find *`는 허용된다. 파일 편집은 금지된다.
 
-**호출 시점.** 사용자가 새 외부 디렉터리를 도입하거나, 알려지지 않은 멀티 루트 구조를 처음 분석할 때 자동 라우터(`hooks/auto-router.ts`)가 라우팅 힌트로 추천한다.
+### 2.3 `ctx-context-curator`
 
-**비편집 보장.** 권한이 read-only로 잠겨 있어 어떤 파일도 편집하지 않는다.
+작업에 필요한 최소 context pack을 만드는 subagent다. 전체 파일 덤프보다 root/path ref, line span, symbol, contract, test, risk처럼 작은 evidence를 우선한다. 구현 전 컨텍스트를 줄이고 unknown을 명시하는 역할이다.
 
-### 2.3 ctx-context-curator (hidden subagent)
+소스 코드는 편집하지 않는다. 단, context pack 산출물을 위해 `.opencode/context-bridge/packs/**` 아래에는 쓸 수 있다. bash는 deny다.
 
-**역할.** 주어진 작업에 대해 최소한의 evidence-backed 컨텍스트 팩을 만든다. whole-file 덤프 대신 정확한 ref, 심볼 이름, 계약 스니펫, 테스트, 위험 항목을 우선한다. 모든 클레임은 `root:path`나 인덱싱된 evidence 항목을 인용해야 한다.
+### 2.4 `ctx-impact-analyst`
 
-**호출 시점.** primary가 cross-repo 구현에 들어가기 전에 위임. 자동 라우터는 워크스페이스/계약 관련 단어를 감지하면 이 에이전트와 `ctx-workspace-architect`를 함께 추천한다.
+변경 영향 분석 전용 subagent다. 같은 파일/심볼의 직접 영향, cross-root reference, DTO/OpenAPI/schema/generated client 같은 contract 영향, runtime-like 영향, 테스트 영향, read-only root 위험, unknown을 정리한다.
 
-### 2.4 ctx-impact-analyst (hidden subagent)
+주요 도구는 `ctx_impact`, `ctx_neighbors`, `ctx_symbols`, `ctx_search`, `ctx_test_plan`이다. 구현과 파일 편집은 하지 않으며 bash도 deny다.
 
-**역할.** 변경의 직접/간접/계약/런타임/테스트/unknown 영향을 분석한다. DTO, OpenAPI, gRPC/proto, GraphQL, cache key, message topic, DB schema, generated client, read-only 루트에 특히 주의를 기울이고, 편집 순서와 검증 체크리스트를 반환한다.
+### 2.5 `ctx-semantic-summarizer`
 
-**호출 시점.** 자동 라우터가 다음 패턴을 감지하면 라우팅 힌트에 포함한다: `dto|schema|payload|request|response|openapi|api|endpoint|grpc|proto|graphql|interface`(계약), `cache|redis|ttl|invalidation|kafka|topic|queue|pubsub|db|database|migration|table|column`(런타임/데이터 경계).
+증거 기반 semantic summary를 작성하는 subagent다. root, file, symbol, contract에 대한 요약을 만들 때 모든 중요한 주장에 evidence anchor를 붙이고, 근거가 없으면 Unknown으로 남긴다.
 
-### 2.5 ctx-test-router (hidden subagent)
+쓰기 가능 경로는 `.opencode/context-bridge/memory/**`와 `.opencode/context-bridge/packs/**`뿐이다. 현재 V0.1에서 `ctx_refresh_memory`는 durable semantic memory 구현이 아니라 compatibility/status shim이므로, 이 에이전트도 실제 근거 파일과 pack을 기준으로 요약해야 한다.
 
-**역할.** 영향받은 루트에 대해 가장 작은 유의미한 테스트/빌드 체크 셋을 선택한다. 패키지 메타데이터, 파일명, 테스트 명명 관습, 변경 ref를 사용한다. 명시적으로 허용되지 않은 명령은 실행 전 ask한다.
+### 2.6 `ctx-test-router`
 
-**bash 권한 화이트리스트.** `npm test*`, `pnpm test*`, `bun test*`, `yarn test*`, `pytest*`, `go test*`, `cargo test*`. 그 외 명령은 모두 ask.
+테스트를 직접 실행하지 않고 validation plan을 고르는 subagent다. `ctx_test_plan`, `ctx_status`, `ctx_impact`, package metadata, 파일명 관습을 사용해 가장 작은 유의미한 검증 범위를 제안한다.
 
----
+출력은 실행 명령 후보, 커버되는 파일/심볼/계약, 커버되지 않는 위험, 추천 runner를 포함한다. 실제 실행은 `ctx-validation-runner`가 맡는다.
 
-## 3. 자동 라우팅과의 연결
+### 2.7 `ctx-validation-runner`
 
-`hooks/auto-router.ts`의 `chat.message` 훅이 사용자 발화를 분류해 `RouteHint`를 만들고 `SessionState`에 저장한다. 같은 모듈의 `experimental.chat.system.transform` 훅이 시스템 프롬프트에 다음 섹션을 항상 추가한다.
+승인된 validation plan이나 사용자가 명시한 검증 범위를 실행하고 결과를 해석하는 subagent다. 파일은 편집하지 않으며, 실패를 root/file/symbol/contract에 매핑해 다음 행동을 제안한다.
 
-- 현재 활성 루트와 매니페스트 경로.
-- 사용 가능한 hidden subagent 목록(이 문서의 다섯 에이전트 중 primary를 제외한 넷).
-- 이번 세션의 라우팅 힌트(있다면).
-- "위험한 cross-root 변경의 기본 시퀀스: ctx_list_roots → ctx_pack → Task(ctx-impact-analyst) → 승인된 rw 루트만 편집 → Task(ctx-test-router)" 안내.
+bash는 테스트 계열 명령만 allowlist로 허용된다. 허용 범위는 `npm test*`, `pnpm test*`, `yarn test*`, `npx vitest*`, `npx jest*`, `pytest*`, `python -m pytest*`다. 그 외 명령은 ask 규칙을 따른다.
 
-분류 규칙(코드 그대로):
+### 2.8 `ctx-builder`
 
-- 워크스페이스 / 리포지토리 / 모듈 단어가 보이면 `ctx-workspace-architect` + `ctx-context-curator`, `taskShape: "workspace"`.
-- 계약/인터페이스/스키마 단어가 보이면 `ctx-impact-analyst` + `ctx-context-curator`, `taskShape: "contract"`.
-- 런타임/데이터 경계 단어가 보이면 `ctx-impact-analyst`, `taskShape: "impact"`.
-- 테스트/디버그 단어가 보이면 `ctx-test-router`, `taskShape`는 디버그 어휘가 있으면 `"debug"`, 그 외 `"test"`.
+승인된 context pack과 impact report를 기반으로 실제 구현을 맡는 subagent다. 편집 전 root access, read-only 여부, impact analysis, contract review, user approval 같은 required gate를 확인해야 한다.
 
-이 규칙은 한국어 단어("작업영역", "레포", "모듈", "서비스", "인터페이스", "스키마", "검증", "오류", "실패")를 일부 포함한다.
+`edit`와 `bash`는 ask 권한이며 `lsp`는 allow다. 승인된 범위 밖의 파일은 편집하지 않고, 필요한 파일이 context pack에 없으면 orchestrator에게 pack 확장을 요청해야 한다. 구현 후에는 변경 파일, 근거, 필요한 검증, 남은 위험을 보고한다.
 
----
+## 3. Runtime commands
 
-## 4. 사용 사례별 흐름
+현재 `src/commands/command-configs.ts`가 등록하는 command는 7개다. 이들은 OpenCode `Config.command` 항목이며, 각 command는 지정된 에이전트로 라우팅된다.
 
-아래 흐름은 모두 현재 코드에서 동작 가능한 도구/훅만 사용한다.
+1. `ctx-add-dir`  
+   외부 디렉터리나 저장소를 Context Bridge 루트로 추가한다. 담당 에이전트는 `ctx-orchestrator`다.
 
-### 사례 A — 외부 백엔드를 추가하고 영향 분석
+2. `ctx-index`  
+   하나 이상의 루트를 다시 인덱싱한다. 담당 에이전트는 `ctx-orchestrator`다.
 
-사용자: "../backend 디렉터리도 워크스페이스에 넣어줘. 그다음 OrderDto 바꾸면 영향 받는 곳 정리해줘."
+3. `ctx-pack`  
+   작업 설명에 맞는 증거 기반 컨텍스트 팩을 만든다. 담당 에이전트는 `ctx-context-curator`이며 subtask로 실행된다.
 
-흐름:
+4. `ctx-impact`  
+   교차 루트 영향과 계약 영향을 분석한다. 담당 에이전트는 `ctx-impact-analyst`이며 subtask로 실행된다.
 
-1. `ctx-orchestrator`가 메시지를 받는다. 자동 라우터는 "워크스페이스 추가"와 "DTO 영향" 단어를 감지해 `ctx-workspace-architect` + `ctx-context-curator` + `ctx-impact-analyst` 라우팅 힌트를 시스템 프롬프트에 주입한다.
-2. orchestrator가 `ctx_add_dir({ path: "../backend" })`를 호출. `WorkspaceStore.addRoot`가 매니페스트에 `backend` 별칭으로 루트를 등록(기본 `ro`). `autoIndex`가 켜져 있으므로 `indexRoot(store, root)`가 즉시 실행되어 `index.jsonl`에 엔트리를 추가한다.
-3. orchestrator가 `Task("ctx-context-curator", "OrderDto 변경 영향 분석을 위한 최소 컨텍스트")`를 위임.
-4. curator는 `ctx_pack({ task: "OrderDto change impact" })`를 호출. `ctx_pack` 도구는 `ensureIndexReady`로 stale 루트를 보강 인덱싱하고, `searchIndex`로 evidence를 모아 `packs/<ts>-orderdto-change-impact.json`에 저장한다.
-5. orchestrator가 `Task("ctx-impact-analyst", "OrderDto 영향 분석")`을 위임. analyst는 `ctx_impact({ target: "OrderDto" })`를 호출하고, 추가로 `ctx_search`나 `ctx_read`로 ref를 확인한다.
-6. orchestrator가 결과를 종합해 사용자에게 직접 영향 ref, 위험 항목, 추천 편집 순서, 알 수 없는 항목을 보고한다. 실제 편집 단계로는 넘어가지 않는다.
+5. `ctx-build`  
+   승인된 컨텍스트를 바탕으로 변경 준비 또는 구현을 맡긴다. 담당 에이전트는 `ctx-builder`이며 subtask로 실행된다.
 
-이 사례에서 발생하는 부수 효과는 다음과 같다. `ledger`(`task-history.jsonl`)에 `root.added`, `root.indexed`, `context.pack`, `impact.analysis` 항목이 기록된다.
+6. `ctx-validate`  
+   기존 validation plan이나 사용자가 지정한 검증 범위를 실행한다. 담당 에이전트는 `ctx-validation-runner`이며 subtask로 실행된다.
 
-### 사례 B — read-only 루트를 잘못 편집하려는 경우
+7. `ctx-summarize`  
+   수집된 증거와 판단을 간결하게 요약한다. 담당 에이전트는 `ctx-semantic-summarizer`이며 subtask로 실행된다.
 
-사용자: "shared 모듈의 OrderDto 정의를 직접 바꿔줘."
+## 4. 자동 라우터
 
-흐름:
+`src/hooks/auto-router.ts`는 사용자 메시지를 분류하고 hidden subagent 사용 힌트를 시스템 프롬프트에 주입한다.
 
-1. 사용자가 사전에 `ctx_add_dir({ path: "../shared", access: "ro" })`를 등록했다고 가정.
-2. orchestrator가 OpenCode 내장 `edit` 도구로 `../shared/src/types/order.ts`에 패치를 시도.
-3. `tool.execute.before` 훅(`hooks/safety.ts`)이 인자에서 path-like 문자열을 추출하고, `WorkspaceStore.findRootByPath`로 가장 깊은 매칭 루트(`shared`)를 찾는다.
-4. 도구가 `edit`/`write`/`apply_patch` 중 하나이고 루트의 `access`가 `ro`이므로 훅이 `Error("Context Bridge blocked edit: root 'shared' is read-only. ...")`를 던진다.
-5. 사용자는 `ctx_add_dir({ path: "../shared", access: "rw" })`로 재등록하거나, primary 루트에서 처리할 패치만 만들고 끝낸다.
+1. `chat.message` 훅  
+   사용자 텍스트를 읽고 `classify` 결과를 `SessionState`에 저장한다. 라우팅 힌트는 ledger에도 `route.hint`로 기록된다.
 
-### 사례 C — 계약 파일 편집과 ledger 경고
+2. `experimental.chat.system.transform` 훅  
+   활성 루트, manifest 경로, hidden subagent 7개 목록, 현재 session의 routing hint, risky cross-root 기본 시퀀스를 시스템 프롬프트에 추가한다.
 
-사용자: "openapi.yaml에 새 엔드포인트 추가해줘."
+자동 라우터가 노출하는 hidden subagent 목록은 다음 7개다.
 
-흐름:
+1. `ctx-workspace-architect`
+2. `ctx-context-curator`
+3. `ctx-semantic-summarizer`
+4. `ctx-impact-analyst`
+5. `ctx-builder`
+6. `ctx-validation-runner`
+7. `ctx-test-router`
 
-1. `tool.execute.before` 훅이 path를 검사한다. 파일이 `policies.contractGlobs`(기본값에 `**/openapi*.yaml` 포함)에 매치되므로 계약 파일로 분류.
-2. `enforceImpactBeforeContractEdit`이 `false`(기본값)이면 차단하지 않고, `appendLedger({ type: "contract.edit.warning", ... })`로 경고만 기록한다.
-3. `enforceImpactBeforeContractEdit`이 `true`이면 즉시 throw. orchestrator는 사용자에게 먼저 `ctx_pack` + `ctx-impact-analyst`를 거치도록 안내한다.
+분류 규칙은 키워드 기반이다.
 
-이 정책은 매니페스트의 `policies.enforceImpactBeforeContractEdit` 한 줄로 켜고 끌 수 있다.
+1. workspace, repository, module, service, external, add-dir, 작업영역, 레포, 모듈, 서비스  
+   `ctx-workspace-architect`와 `ctx-context-curator`를 추천하고 `taskShape`를 `workspace`로 둔다.
 
-### 사례 D — 컴팩션 후 작업 재개
+2. summary, summarize, semantic summary, 요약, 정리  
+   `ctx-semantic-summarizer`를 추천한다.
 
-사용자가 긴 세션에서 여러 외부 루트를 추가하고 일부 파일을 편집한 뒤 컴팩션이 일어나는 경우.
+3. DTO, schema, payload, request, response, OpenAPI, API, endpoint, gRPC, proto, GraphQL, interface, 인터페이스, 스키마  
+   `ctx-impact-analyst`와 `ctx-context-curator`를 추천하고 `taskShape`를 `contract`로 둔다.
 
-흐름:
+4. cache, redis, TTL, invalidation, Kafka, topic, queue, pubsub, DB, database, migration, table, column  
+   `ctx-impact-analyst`를 추천하고 `taskShape`를 `impact`로 둔다.
 
-1. `experimental.session.compacting` 훅(`hooks/compaction.ts`)이 호출된다.
-2. 훅은 `WorkspaceStore.workspaceSummary()`로 루트 목록 텍스트, `SessionState.touched(sessionID)`로 이번 세션에서 touched된 ref 목록, `WorkspaceStore.recentLedger(12)`로 최근 ledger를 모은다.
-3. 이 정보를 컨티뉴에이션 컨텍스트(`output.context`)에 마크다운으로 푸시한다. 마지막 항목은 "재개 규칙: cross-root 작업이라면 매니페스트를 경로로 다시 열고 `ctx_list_roots`를 호출하고 stale 루트를 편집하기 전에 `ctx_pack`을 다시 만들어라"이다.
-4. 컴팩션 후 새 컨텍스트에서도 활성 루트와 진행 상태가 살아 있으므로, orchestrator가 작업을 자연스럽게 이어간다.
+5. implement, build, edit, change, modify, refactor, code, 작성, 구현, 수정  
+   `ctx-builder`를 추천한다.
 
-### 사례 E — 테스트 라우팅
+6. test, 검증, validate, build, lint, failure, bug, debug, 오류, 실패  
+   `ctx-test-router`를 추천한다. validate, validation, 검증, test plan, plan이 있으면 `ctx-validation-runner`도 추천한다.
 
-사용자: "지금 변경된 파일에 대해 빠르게 검증만 돌려줘."
+기본 risky cross-root 흐름은 `ctx_list_roots`, `ctx_pack`, `Task(ctx-impact-analyst)`, `Task(ctx-builder)`, `Task(ctx-validation-runner)`, `Task(ctx-test-router)` 순서다. 실제 순서는 작업 성격과 이미 확보한 증거에 따라 줄어들 수 있다.
 
-흐름:
+## 6. 사용 사례 흐름
 
-1. orchestrator가 `Task("ctx-test-router", "현재 touched ref에 대한 타깃 테스트 선택")`을 위임.
-2. test-router는 `ctx_list_roots`로 루트와 패키지 메타데이터를 확인하고 `ctx_search`로 테스트 후보를 찾는다.
-3. router의 bash 권한이 `pnpm test*`, `pytest*` 등에 한해 `ask`이므로, 후보 명령만 제시하고 실제 실행은 사용자 승인 후에만 수행한다.
+### 사례 A. 외부 루트 추가 후 인덱싱
 
----
+사용자 요청: `../backend를 Context Bridge 루트로 추가하고 인덱싱해줘.`
 
-## 5. 슬래시 명령
+1. `ctx-add-dir` command 또는 primary 에이전트가 `ctx_add_dir`를 호출한다.
+2. `autoIndex`가 켜져 있으면 새 루트를 즉시 인덱싱한다.
+3. 필요하면 `ctx_index`로 명시 재인덱싱한다.
+4. `ctx_list_roots` 또는 `ctx_status`로 manifest와 stale 상태를 요약한다.
 
-`injectContextBridgeAgents`가 등록하는 슬래시 명령은 셋이다. 모두 `agent: ctx-orchestrator`로 위임된다.
+### 사례 B. DTO 또는 API 변경 영향 확인
 
-- `/ctx-list`: orchestrator가 `ctx_list_roots`를 호출하고 stale/ro 루트를 설명하도록 지시.
-- `/ctx-pack <task>`: `ctx_pack`을 호출해 작업 팩을 생성.
-- `/ctx-impact <target>`: `ctx-impact-analyst`에게 위임. 필요시 `ctx_search`/`ctx_pack` 보강.
+사용자 요청: `OrderDto를 바꾸면 영향 받는 곳을 정리해줘.`
 
-도구와 명령의 정확한 인자/리턴 형식은 `tools.md` 참고.
+1. 자동 라우터가 contract 키워드를 감지해 `ctx-impact-analyst`와 `ctx-context-curator`를 추천한다.
+2. `ctx_pack`이 작업 관련 증거를 모은다.
+3. `ctx_impact`와 필요 시 `ctx_neighbors`, `ctx_symbols`, `ctx_search`가 영향 후보를 찾는다.
+4. 결과는 direct impact, cross-root impact, contract impact, affected tests, unknowns, recommended edit order로 정리한다.
 
----
+### 사례 C. 승인된 구현 작업
 
-## 6. 안전 원칙 요약
+사용자 요청: `팩과 영향 분석 기준으로 구현까지 진행해줘.`
 
-코드에 명시된 다음 원칙을 모든 에이전트가 공유한다.
+1. `ctx-orchestrator`가 루트 접근 권한과 required gate를 확인한다.
+2. 구현 범위가 명확하면 `ctx-builder`에 넘긴다.
+3. `ctx-builder`는 승인된 파일과 범위 안에서만 편집을 요청한다.
+4. 구현 뒤에는 변경 파일, 근거, 남은 위험, 검증 필요 항목을 보고한다.
 
-- evidence 없는 시맨틱 요약은 신뢰하지 않는다. 모든 클레임에 ref가 붙어야 한다.
-- subagent는 파일을 직접 편집하지 않는다(`ctx-test-router` 포함, 편집 권한이 deny로 잠금).
-- primary는 위임 가능한 에이전트가 `ctx-*`로 한정된다.
-- read-only 루트, 시크릿 경로, 계약 파일에 대한 편집은 `tool.execute.before`에서 일관되게 게이트된다.
-- 도구 실행 후 touched ref는 `SessionState`와 매니페스트의 stale 플래그로 추적되어, 이후 인덱싱과 컴팩션에서 사용된다.
+### 사례 D. 검증 계획과 실행
+
+사용자 요청: `변경 범위에 맞는 테스트를 고르고 실행해줘.`
+
+1. 자동 라우터가 test 또는 validation 키워드를 감지한다.
+2. `ctx-test-router`가 `ctx_test_plan`, `ctx_status`, `ctx_impact`, package metadata를 사용해 validation plan을 만든다.
+3. 실행 범위가 명확하면 `ctx-validation-runner`가 계획에 있는 명령 또는 명백히 동등한 targeted test를 실행한다.
+4. 결과는 pass, fail, blocked, partial 중 하나로 보고하고 실패를 관련 root, file, symbol, contract에 매핑한다.
+
+### 사례 E. 요약과 메모리 호환 흐름
+
+사용자 요청: `현재 조사 결과를 요약해줘.`
+
+1. 자동 라우터가 summary 키워드를 감지해 `ctx-semantic-summarizer`를 추천한다.
+2. summarizer는 증거, 결정, unknown을 간결하게 정리한다.
+3. 필요한 경우 `.opencode/context-bridge/memory/**` 또는 `packs/**` 아래에만 기록한다.
+4. `ctx_refresh_memory`가 호출되더라도 V0.1에서는 durable semantic memory를 만드는 것이 아니라 상태와 호환성 정보를 반환한다.
+
+## 7. V0.1 한계
+
+1. `ctx_neighbors`는 heuristic이다. 같은 파일, 같은 이름, 같은 디렉터리, ref 관련 문자열을 기반으로 하며 구조적 import 또는 call graph 증명이 아니다.
+
+2. `ctx_test_plan`은 heuristic이다. 인덱싱된 test/package 항목과 `package.json` script를 보고 명령 후보를 제안하지만 실행하거나 성공을 보장하지 않는다.
+
+3. `ctx_refresh_memory`는 compatibility/status shim이다. durable semantic memory, embeddings, 구조적 graph memory를 제공하지 않는다.
+
+4. V0.1 인덱스는 경량 텍스트 기반 JSONL 증거다. 낮은 증거나 unknown은 `ctx_read`, `ctx_search`, targeted validation으로 확인해야 한다.
+
+## 8. 안전 원칙 요약
+
+1. 증거 없는 요약은 ground truth가 아니다. 중요한 판단에는 ref, symbol, contract, tool output 같은 근거가 필요하다.
+
+2. read-only 루트는 편집 대상으로 가정하지 않는다. 구현 전에는 루트 접근 권한을 확인한다.
+
+3. 계약, DTO, schema, generated client, cache key, DB, topic 변경은 구현 전에 impact 분석을 거친다.
+
+4. primary 에이전트는 조율을 맡고, 실제 구현은 준비된 컨텍스트와 영향 분석을 바탕으로 `ctx-builder`에 넘기는 흐름을 따른다.
+
+5. 검증은 계획과 실행을 나눈다. `ctx-test-router`는 계획을 만들고, `ctx-validation-runner`는 승인된 범위를 실행하고 해석한다.
