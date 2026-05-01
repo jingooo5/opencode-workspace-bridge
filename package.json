@@ -1,0 +1,31 @@
+{
+  "name": "opencode-context-bridge",
+  "version": "0.1.0-draft.2",
+  "type": "module",
+  "description": "Multi-root workspace context orchestration plugin for opencode.",
+  "bin": {
+    "context-bridge": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "bun-types": "latest",
+    "typescript": "^5.9.0"
+  }
+}
