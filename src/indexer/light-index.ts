@@ -165,7 +165,7 @@ async function appendEntries(indexPath: string, entries: IndexEntry[]): Promise<
   await writeFile(indexPath, all.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
 }
 
-async function readEntries(indexPath: string): Promise<IndexEntry[]> {
+export async function readEntries(indexPath: string): Promise<IndexEntry[]> {
   if (!existsSync(indexPath)) return [];
   const text = await readFile(indexPath, "utf8").catch(() => "");
   return text

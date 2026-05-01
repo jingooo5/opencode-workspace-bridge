@@ -1,7 +1,8 @@
 import type { Config, Hooks, PluginInput } from "@opencode-ai/plugin";
 import type { ContextBridgeOptions } from "./types.js";
 import type { Managers } from "./create-managers.js";
-import { injectContextBridgeAgents } from "./agents/agent-configs.js";
+import { injectContextBridgeAgents } from "./agents/agent-install.js";
+import { injectContextBridgeCommands } from "./commands/command-configs.js";
 
 export function createPluginInterface(args: {
   ctx: PluginInput;
@@ -16,6 +17,9 @@ export function createPluginInterface(args: {
       if (options.autoAgents) {
         injectContextBridgeAgents(config, {
           autoDefaultAgent: options.autoDefaultAgent,
+          defaultAgentName: options.defaultAgentName,
+        });
+        injectContextBridgeCommands(config, {
           defaultAgentName: options.defaultAgentName,
         });
       }

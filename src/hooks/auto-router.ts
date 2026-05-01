@@ -29,14 +29,17 @@ When the user task mentions cross-repository work, external directories, modules
 Available hidden subagents through the Task tool:
 - ctx-workspace-architect: workspace/root discovery and multi-root map
 - ctx-context-curator: evidence-backed minimal context pack
+- ctx-semantic-summarizer: compact semantic summary of gathered evidence, decisions, and unknowns
 - ctx-impact-analyst: DTO/API/schema/cache/topic/DB cross-root impact analysis
+- ctx-builder: implementation handoff when context is ready and edits should begin
+- ctx-validation-runner: execution handoff when a concrete validation plan already exists
 - ctx-test-router: affected test/build selection
 
 Routing hint for this session:
 ${hint ? `- taskShape: ${hint.taskShape}\n- suggested agents: ${hint.agents.join(", ")}\n- reason: ${hint.reason}` : "- none yet"}
 
 Default sequence for risky cross-root changes:
-ctx_list_roots → ctx_pack → Task(ctx-impact-analyst) → edit only approved rw roots → Task(ctx-test-router).
+ctx_list_roots → ctx_pack → Task(ctx-impact-analyst) when contracts or boundaries are affected → Task(ctx-builder) for implementation → Task(ctx-validation-runner) when a validation plan exists → Task(ctx-test-router) for targeted test/build selection.
 `);
     },
   };
@@ -54,6 +57,10 @@ function classify(text: string): RouteHint | undefined {
     taskShape = "workspace";
     reasons.push("workspace/repository/module language detected");
   }
+  if (/summary|summarize|semantic summary|요약|정리/.test(lower)) {
+    agents.add("ctx-semantic-summarizer");
+    reasons.push("summary language detected");
+  }
   if (/dto|schema|payload|request|response|openapi|api|endpoint|grpc|proto|graphql|interface|인터페이스|스키마/.test(lower)) {
     agents.add("ctx-impact-analyst");
     agents.add("ctx-context-curator");
@@ -65,8 +72,16 @@ function classify(text: string): RouteHint | undefined {
     taskShape = "impact";
     reasons.push("runtime boundary or data boundary language detected");
   }
+  if (/implement|implementation|build|edit|change|modify|refactor|code|작성|구현|수정/.test(lower)) {
+    agents.add("ctx-builder");
+    reasons.push("implementation language detected");
+  }
   if (/test|검증|validate|build|lint|failure|bug|debug|오류|실패/.test(lower)) {
     agents.add("ctx-test-router");
+    if (/validate|validation|검증|test plan|plan/.test(lower)) {
+      agents.add("ctx-validation-runner");
+      reasons.push("validation execution language detected");
+    }
     if (taskShape === "general") taskShape = /bug|debug|오류|실패/.test(lower) ? "debug" : "test";
     reasons.push("debug/test/validation language detected");
   }
