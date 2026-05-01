@@ -2,18 +2,20 @@ import os from "node:os";
 import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { z } from "zod";
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { ContextBridgeOptions } from "../types.js";
 import { agentMarkdown, getContextBridgeAgentSpecs } from "../agents/agent-configs.js";
 import { log } from "../shared/log.js";
 
-export interface BootstrapResult {
-  configPath?: string;
-  agentDir?: string;
-  wroteAgents: string[];
-  wroteConfig: boolean;
-  skipped: string[];
-}
+export const BootstrapResultSchema = z.object({
+  configPath: z.string().optional(),
+  agentDir: z.string().optional(),
+  wroteAgents: z.array(z.string()),
+  wroteConfig: z.boolean(),
+  skipped: z.array(z.string()),
+});
+export type BootstrapResult = z.infer<typeof BootstrapResultSchema>;
 
 export async function ensureGlobalBootstrap(ctx: PluginInput, options: ContextBridgeOptions): Promise<BootstrapResult> {
   const result: BootstrapResult = { wroteAgents: [], wroteConfig: false, skipped: [] };

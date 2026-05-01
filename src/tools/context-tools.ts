@@ -2,13 +2,21 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
-import type { PluginInput } from "@opencode-ai/plugin";
-import type { ContextBridgeOptions } from "../types.js";
+import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
+import { RootRoleSchema, type ContextBridgeOptions } from "../types.js";
 import type { WorkspaceStore } from "../state/workspace-store.js";
 import { ensureGlobalBootstrap } from "../bootstrap/global-bootstrap.js";
 import { indexRoot, searchIndex } from "../indexer/light-index.js";
 
-export function createContextTools(ctx: PluginInput, store: WorkspaceStore, options: ContextBridgeOptions) {
+// Use the plugin's own zod instance so schemas are guaranteed compatible with
+// the runtime that ultimately consumes tool definitions.
+const z = tool.schema;
+
+export function createContextTools(
+  ctx: PluginInput,
+  store: WorkspaceStore,
+  options: ContextBridgeOptions,
+): Record<string, ToolDefinition> {
   return {
     ctx_install_agents: tool({
       description: "Repair/re-run Context Bridge global bootstrap. This is not required normally; the plugin runs it automatically on startup.",
@@ -22,17 +30,17 @@ export function createContextTools(ctx: PluginInput, store: WorkspaceStore, opti
     ctx_add_dir: tool({
       description: "Add an external directory/repository to the Context Bridge workspace manifest. Use before reading or reasoning about files outside the primary OpenCode directory.",
       args: {
-        path: tool.schema.string().describe("Directory path, absolute or relative to the current OpenCode directory."),
-        name: tool.schema.string().optional().describe("Stable root alias, for example backend or shared."),
-        access: tool.schema.enum(["ro", "rw"]).optional().describe("Access mode. ro means analysis only; rw allows edits subject to OpenCode permissions."),
-        role: tool.schema.string().optional().describe("Root role: app, service, library, tooling, docs, unknown."),
-        tags: tool.schema.array(tool.schema.string()).optional().describe("Optional tags."),
+        path: z.string().min(1).describe("Directory path, absolute or relative to the current OpenCode directory."),
+        name: z.string().min(1).optional().describe("Stable root alias, for example backend or shared."),
+        access: z.enum(["ro", "rw"]).optional().describe("Access mode. ro means analysis only; rw allows edits subject to OpenCode permissions."),
+        role: z.enum(RootRoleSchema.options).optional().describe("Root role: primary, app, service, library, tooling, docs, unknown."),
+        tags: z.array(z.string()).optional().describe("Optional tags."),
       },
       async execute(args) {
         const root = await store.addRoot(args.path, {
           name: args.name,
           access: args.access ?? options.defaultAccess,
-          role: args.role as never,
+          role: args.role,
           tags: args.tags,
         });
         if (options.autoIndex) await indexRoot(store, root);
@@ -51,7 +59,7 @@ export function createContextTools(ctx: PluginInput, store: WorkspaceStore, opti
     ctx_index: tool({
       description: "Build or refresh the lightweight V0.1 evidence index for one root or all roots. Usually optional because autoIndex is enabled by default.",
       args: {
-        root: tool.schema.string().optional().describe("Root alias to index. If omitted, index all roots."),
+        root: z.string().min(1).optional().describe("Root alias to index. If omitted, index all roots."),
       },
       async execute(args) {
         const roots = await store.listRoots();
@@ -68,9 +76,9 @@ export function createContextTools(ctx: PluginInput, store: WorkspaceStore, opti
     ctx_search: tool({
       description: "Search the Context Bridge multi-root evidence index across root aliases. Use this instead of raw grep when the task may span repositories.",
       args: {
-        query: tool.schema.string().describe("Search query."),
-        roots: tool.schema.array(tool.schema.string()).optional().describe("Optional root aliases to restrict search."),
-        limit: tool.schema.number().optional().describe("Maximum hits."),
+        query: z.string().min(1).describe("Search query."),
+        roots: z.array(z.string()).optional().describe("Optional root aliases to restrict search."),
+        limit: z.number().int().positive().optional().describe("Maximum hits."),
       },
       async execute(args) {
         await ensureIndexReady(store, options);
@@ -84,9 +92,9 @@ export function createContextTools(ctx: PluginInput, store: WorkspaceStore, opti
     ctx_read: tool({
       description: "Read a file by root alias reference, for example backend:src/routes/orders.ts. Safer than absolute-path read for multi-root work.",
       args: {
-        ref: tool.schema.string().describe("Root alias reference: root:path/to/file."),
-        startLine: tool.schema.number().optional(),
-        endLine: tool.schema.number().optional(),
+        ref: z.string().min(1).describe("Root alias reference: root:path/to/file."),
+        startLine: z.number().int().positive().optional(),
+        endLine: z.number().int().positive().optional(),
       },
       async execute(args) {
         const resolved = await store.resolveRef(args.ref);
@@ -104,9 +112,9 @@ export function createContextTools(ctx: PluginInput, store: WorkspaceStore, opti
     ctx_pack: tool({
       description: "Create a task-specific context pack from the multi-root evidence index. Use before cross-repo edits, DTO/API changes, or debugging distributed flows.",
       args: {
-        task: tool.schema.string().describe("Natural language task description."),
-        roots: tool.schema.array(tool.schema.string()).optional(),
-        limit: tool.schema.number().optional(),
+        task: z.string().min(1).describe("Natural language task description."),
+        roots: z.array(z.string()).optional(),
+        limit: z.number().int().positive().optional(),
       },
       async execute(args) {
         await ensureIndexReady(store, options);
@@ -136,8 +144,8 @@ export function createContextTools(ctx: PluginInput, store: WorkspaceStore, opti
     ctx_impact: tool({
       description: "V0.1 lightweight impact analysis for a root:path, symbol, DTO, API, or search phrase. Produces evidence-backed candidate impacts.",
       args: {
-        target: tool.schema.string().describe("Target ref or phrase, for example shared:src/types/order.ts or OrderDto."),
-        limit: tool.schema.number().optional(),
+        target: z.string().min(1).describe("Target ref or phrase, for example shared:src/types/order.ts or OrderDto."),
+        limit: z.number().int().positive().optional(),
       },
       async execute(args) {
         await ensureIndexReady(store, options);

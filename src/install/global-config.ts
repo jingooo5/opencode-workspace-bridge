@@ -3,22 +3,25 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile, copyFile } from "node:fs/promises";
 import { applyEdits, modify, parse } from "jsonc-parser";
+import { z } from "zod";
 
-export interface InstallOptions {
-  pluginName?: string;
-  defaultAgent?: string;
-  setDefaultAgent?: boolean;
-  forceDefaultAgent?: boolean;
-  configDir?: string;
-}
+export const InstallOptionsSchema = z.object({
+  pluginName: z.string().optional(),
+  defaultAgent: z.string().optional(),
+  setDefaultAgent: z.boolean().optional(),
+  forceDefaultAgent: z.boolean().optional(),
+  configDir: z.string().optional(),
+});
+export type InstallOptions = z.infer<typeof InstallOptionsSchema>;
 
-export interface InstallResult {
-  configPath: string;
-  backupPath?: string;
-  pluginRegistered: boolean;
-  defaultAgentSet: boolean;
-  previousDefaultAgent?: string;
-}
+export const InstallResultSchema = z.object({
+  configPath: z.string(),
+  backupPath: z.string().optional(),
+  pluginRegistered: z.boolean(),
+  defaultAgentSet: z.boolean(),
+  previousDefaultAgent: z.string().optional(),
+});
+export type InstallResult = z.infer<typeof InstallResultSchema>;
 
 const SCHEMA = "https://opencode.ai/config.json";
 
@@ -29,11 +32,12 @@ export function defaultOpencodeConfigDir(): string {
 }
 
 export async function installGlobalConfig(options: InstallOptions = {}): Promise<InstallResult> {
-  const pluginName = options.pluginName ?? "opencode-context-bridge";
-  const defaultAgent = options.defaultAgent ?? "ctx-orchestrator";
-  const setDefaultAgent = options.setDefaultAgent ?? true;
-  const forceDefaultAgent = options.forceDefaultAgent ?? true;
-  const configDir = options.configDir ?? defaultOpencodeConfigDir();
+  const validated = InstallOptionsSchema.parse(options);
+  const pluginName = validated.pluginName ?? "opencode-context-bridge";
+  const defaultAgent = validated.defaultAgent ?? "ctx-orchestrator";
+  const setDefaultAgent = validated.setDefaultAgent ?? true;
+  const forceDefaultAgent = validated.forceDefaultAgent ?? true;
+  const configDir = validated.configDir ?? defaultOpencodeConfigDir();
 
   await mkdir(configDir, { recursive: true });
   const configPath = await chooseConfigPath(configDir);

@@ -1,5 +1,11 @@
+import { z } from "zod";
 import type { PluginOptions } from "@opencode-ai/plugin";
-import type { AccessMode, ContextBridgeOptions, RootRole } from "./types.js";
+import {
+  AccessModeSchema,
+  ContextBridgeOptionsSchema,
+  RootInputSchema,
+  type ContextBridgeOptions,
+} from "./types.js";
 
 const DEFAULT_SECRET_GLOBS = [".env", ".env.*", "**/secrets/**", "**/*.pem", "**/*.key"];
 const DEFAULT_CONTRACT_GLOBS = [
@@ -13,7 +19,7 @@ const DEFAULT_CONTRACT_GLOBS = [
   "**/migrations/**",
 ];
 
-export const DEFAULT_OPTIONS: ContextBridgeOptions = {
+export const DEFAULT_OPTIONS: ContextBridgeOptions = ContextBridgeOptionsSchema.parse({
   stateDir: ".opencode/context-bridge",
   defaultAccess: "ro",
   autoAgents: true,
@@ -32,81 +38,55 @@ export const DEFAULT_OPTIONS: ContextBridgeOptions = {
   contractGlobs: DEFAULT_CONTRACT_GLOBS,
   enforceImpactBeforeContractEdit: false,
   roots: [],
-};
+});
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
+const finiteNumber = z.number().refine(Number.isFinite, "must be finite");
 
-function asString(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
+const optional = <T extends z.ZodTypeAny>(schema: T) =>
+  schema.optional().catch(undefined);
 
-function asBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function asNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function asStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.filter((item): item is string => typeof item === "string");
-}
-
-function asAccess(value: unknown): AccessMode | undefined {
-  return value === "ro" || value === "rw" ? value : undefined;
-}
-
-function asRole(value: unknown): RootRole | undefined {
-  if (typeof value !== "string") return undefined;
-  if (["primary", "app", "service", "library", "tooling", "docs", "unknown"].includes(value)) {
-    return value as RootRole;
-  }
-  return undefined;
-}
+const RawOptionsSchema = z
+  .object({
+    stateDir: optional(z.string()),
+    defaultAccess: optional(AccessModeSchema),
+    autoAgents: optional(z.boolean()),
+    autoDefaultAgent: optional(z.boolean()),
+    globalBootstrap: optional(z.boolean()),
+    globalInstallAgents: optional(z.boolean()),
+    globalSetDefaultAgent: optional(z.boolean()),
+    globalRegisterPlugin: optional(z.boolean()),
+    globalPluginName: optional(z.string()),
+    defaultAgentName: optional(z.string()),
+    autoIndex: optional(z.boolean()),
+    commandPrefix: optional(z.string()),
+    maxSearchResults: optional(finiteNumber),
+    maxReadBytes: optional(finiteNumber),
+    secretGlobs: optional(z.array(z.string())),
+    contractGlobs: optional(z.array(z.string())),
+    enforceImpactBeforeContractEdit: optional(z.boolean()),
+    roots: optional(z.array(z.unknown())),
+  })
+  .catch({});
 
 export function normalizeOptions(options?: PluginOptions): ContextBridgeOptions {
-  if (!isRecord(options)) return { ...DEFAULT_OPTIONS };
+  const raw = RawOptionsSchema.parse(options ?? {});
 
-  const roots = Array.isArray(options.roots)
-    ? options.roots.flatMap((item) => {
-        if (!isRecord(item)) return [];
-        const path = asString(item.path);
-        if (!path) return [];
-        return [
-          {
-            path,
-            name: asString(item.name),
-            access: asAccess(item.access),
-            role: asRole(item.role),
-            tags: asStringArray(item.tags),
-          },
-        ];
-      })
-    : [];
+  const roots = (raw.roots ?? []).flatMap((item) => {
+    const parsed = RootInputSchema.safeParse(item);
+    return parsed.success ? [parsed.data] : [];
+  });
 
-  return {
+  return ContextBridgeOptionsSchema.parse({
     ...DEFAULT_OPTIONS,
-    stateDir: asString(options.stateDir) ?? DEFAULT_OPTIONS.stateDir,
-    defaultAccess: asAccess(options.defaultAccess) ?? DEFAULT_OPTIONS.defaultAccess,
-    autoAgents: asBoolean(options.autoAgents) ?? DEFAULT_OPTIONS.autoAgents,
-    autoDefaultAgent: asBoolean(options.autoDefaultAgent) ?? DEFAULT_OPTIONS.autoDefaultAgent,
-    globalBootstrap: asBoolean(options.globalBootstrap) ?? DEFAULT_OPTIONS.globalBootstrap,
-    globalInstallAgents: asBoolean(options.globalInstallAgents) ?? DEFAULT_OPTIONS.globalInstallAgents,
-    globalSetDefaultAgent: asBoolean(options.globalSetDefaultAgent) ?? DEFAULT_OPTIONS.globalSetDefaultAgent,
-    globalRegisterPlugin: asBoolean(options.globalRegisterPlugin) ?? DEFAULT_OPTIONS.globalRegisterPlugin,
-    globalPluginName: asString(options.globalPluginName) ?? DEFAULT_OPTIONS.globalPluginName,
-    defaultAgentName: asString(options.defaultAgentName) ?? DEFAULT_OPTIONS.defaultAgentName,
-    autoIndex: asBoolean(options.autoIndex) ?? DEFAULT_OPTIONS.autoIndex,
-    commandPrefix: asString(options.commandPrefix) ?? DEFAULT_OPTIONS.commandPrefix,
-    maxSearchResults: asNumber(options.maxSearchResults) ?? DEFAULT_OPTIONS.maxSearchResults,
-    maxReadBytes: asNumber(options.maxReadBytes) ?? DEFAULT_OPTIONS.maxReadBytes,
-    secretGlobs: asStringArray(options.secretGlobs) ?? DEFAULT_OPTIONS.secretGlobs,
-    contractGlobs: asStringArray(options.contractGlobs) ?? DEFAULT_OPTIONS.contractGlobs,
-    enforceImpactBeforeContractEdit:
-      asBoolean(options.enforceImpactBeforeContractEdit) ?? DEFAULT_OPTIONS.enforceImpactBeforeContractEdit,
+    ...definedOnly(raw),
     roots,
-  };
+  });
+}
+
+function definedOnly<T extends Record<string, unknown>>(value: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (val !== undefined) (out as Record<string, unknown>)[key] = val;
+  }
+  return out;
 }

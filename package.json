@@ -18,7 +18,8 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "jsonc-parser": "^3.3.1"
+    "jsonc-parser": "^3.3.1",
+    "zod": "^4.4.1"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
@@ -26,6 +27,9 @@
   "devDependencies": {
     "@opencode-ai/plugin": "latest",
     "bun-types": "latest",
-    "typescript": "^5.9.0"
-  }
+    "typescript": "^5.9.0",
+    "@types/bun": "latest"
+  },
+  "module": "src/index.ts",
+  "private": true
 }

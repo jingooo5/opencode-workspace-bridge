@@ -1,7 +1,7 @@
 import path from "node:path";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import type { IndexEntry, RootSpec, SearchHit } from "../types.js";
+import { IndexEntrySchema, type IndexEntry, type RootSpec, type SearchHit } from "../types.js";
 import { refOf } from "../shared/path.js";
 import type { WorkspaceStore } from "../state/workspace-store.js";
 
@@ -174,7 +174,8 @@ async function readEntries(indexPath: string): Promise<IndexEntry[]> {
     .filter(Boolean)
     .flatMap((line) => {
       try {
-        return [JSON.parse(line) as IndexEntry];
+        const parsed = IndexEntrySchema.safeParse(JSON.parse(line));
+        return parsed.success ? [parsed.data] : [];
       } catch {
         return [];
       }

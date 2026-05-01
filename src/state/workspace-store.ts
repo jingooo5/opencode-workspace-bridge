@@ -2,7 +2,13 @@ import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import type { PluginInput } from "@opencode-ai/plugin";
-import type { AccessMode, ContextBridgeOptions, RootSpec, WorkspaceManifest } from "../types.js";
+import {
+  WorkspaceManifestSchema,
+  type AccessMode,
+  type ContextBridgeOptions,
+  type RootSpec,
+  type WorkspaceManifest,
+} from "../types.js";
 import { globishMatch, isInside, parseRef, refOf, slugify, toAbs, toRelOrAbs } from "../shared/path.js";
 
 export class WorkspaceStore {
@@ -57,12 +63,19 @@ export class WorkspaceStore {
 
   async readManifest(): Promise<WorkspaceManifest> {
     const text = await readFile(this.manifestPath, "utf8");
-    return JSON.parse(text) as WorkspaceManifest;
+    const parsed = WorkspaceManifestSchema.safeParse(JSON.parse(text));
+    if (!parsed.success) {
+      throw new Error(
+        `Invalid workspace manifest at ${this.manifestPath}: ${parsed.error.message}`,
+      );
+    }
+    return parsed.data;
   }
 
   async writeManifest(manifest: WorkspaceManifest): Promise<void> {
+    const validated = WorkspaceManifestSchema.parse(manifest);
     await mkdir(path.dirname(this.manifestPath), { recursive: true });
-    await writeFile(this.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+    await writeFile(this.manifestPath, `${JSON.stringify(validated, null, 2)}\n`, "utf8");
   }
 
   async addRoot(
