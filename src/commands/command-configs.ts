@@ -61,7 +61,7 @@ export function getContextBridgeCommandSpecs(
       name: "ctx-pack",
       description: "Build a task-specific context pack from indexed evidence",
       template:
-        "Create a context pack for this task:\n\n$ARGUMENTS\n\nUse `ctx_pack` first. Then inspect only the most relevant evidence with `ctx_read` or `ctx_neighbors` if needed.\n\nReturn:\n- pack path\n- relevant roots\n- relevant files and symbols\n- contracts or endpoints\n- risks\n- missing evidence\n- suggested next agent, if any",
+        "Create a context pack for this task:\n\n$ARGUMENTS\n\nUse `ctx_pack` first. Then inspect only the most relevant evidence with `ctx_read` if needed.\n\nReturn:\n- pack path\n- relevant roots\n- relevant files and symbols\n- contracts or endpoints\n- risks\n- missing evidence\n- suggestedNext: `ctx-builder` when implementation should start, `ctx-validation-runner` when a concrete validation plan already exists, otherwise the most relevant next agent",
       agent: "ctx-context-curator",
       subtask: true,
     },
@@ -71,6 +71,30 @@ export function getContextBridgeCommandSpecs(
       template:
         "Analyze impact for:\n\n$ARGUMENTS\n\nUse:\n1. `ctx_impact`\n2. `ctx_neighbors` if impact graph is incomplete\n3. `ctx_test_plan` for affected tests\n\nReturn direct impact, indirect impact, contract impact, affected roots, affected tests, unknowns, and recommended edit order.",
       agent: "ctx-impact-analyst",
+      subtask: true,
+    },
+    {
+      name: "ctx-build",
+      description: "Prepare or implement the requested change from approved context",
+      template:
+        "Use the approved context and user request to prepare or implement the change.\n\nTask:\n$ARGUMENTS\n\nRequired behavior:\n1. Keep the work scoped to the requested change.\n2. Use available context packs or impact results when present.\n3. Call out missing implementation evidence before making risky assumptions.\n4. End with a concise implementation summary and any follow-up validation that should run next.",
+      agent: "ctx-builder",
+      subtask: true,
+    },
+    {
+      name: "ctx-validate",
+      description: "Execute an existing validation plan for the current task",
+      template:
+        "Execute the validation plan for this task.\n\nPlan or scope:\n$ARGUMENTS\n\nRequired behavior:\n1. Follow the existing validation plan or the explicit validation scope from the user.\n2. Report pass/fail status, notable findings, and anything still unverified.\n3. Do not expand scope beyond the requested checks unless a blocking issue forces it.\n4. End with the next recommended action if validation fails or remains incomplete.",
+      agent: "ctx-validation-runner",
+      subtask: true,
+    },
+    {
+      name: "ctx-summarize",
+      description: "Produce a semantic summary of gathered context or findings",
+      template:
+        "Create a semantic summary for the current task context.\n\nFocus:\n$ARGUMENTS\n\nRequired behavior:\n1. Summarize the most relevant evidence, decisions, and unknowns.\n2. Keep the summary compact and task-directed.\n3. Highlight cross-root relationships or contracts only when they materially matter.\n4. Suggest the most relevant next agent when the summary reveals a clear handoff.",
+      agent: "ctx-semantic-summarizer",
       subtask: true,
     },
   ];
