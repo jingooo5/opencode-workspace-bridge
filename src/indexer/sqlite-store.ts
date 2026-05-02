@@ -108,6 +108,66 @@ export interface MarkSummariesStaleForFileInput {
   updatedAt?: string;
 }
 
+export interface SQLiteContractInput {
+  id: string;
+  kind: string;
+  name: string;
+  rootId: string;
+  fileId?: string;
+  sourceNodeId?: string;
+  signatureHash: string;
+  generatedYamlPath?: string | null;
+  confidence: number;
+  attrs: Record<string, unknown>;
+  consumers: Array<{
+    consumerNodeId: string;
+    consumerRootId: string;
+    evidenceEdgeId?: string;
+    confidence: number;
+    attrs: Record<string, unknown>;
+  }>;
+  related: Array<{
+    nodeId: string;
+    relation: string;
+    confidence: number;
+    attrs: Record<string, unknown>;
+  }>;
+}
+
+export interface PersistContractsInput {
+  contracts: SQLiteContractInput[];
+  updatedAt: string;
+}
+
+export interface DebugContractRecord {
+  id: string;
+  kind: string;
+  name: string;
+  rootId: string;
+  rootName: string;
+  fileId?: string;
+  relPath?: string;
+  sourceNodeId?: string;
+  signatureHash: string;
+  generatedYamlPath?: string;
+  status: string;
+  confidence: number;
+  attrs: Record<string, unknown>;
+  consumers: Array<{
+    consumerNodeId: string;
+    consumerRootId: string;
+    evidenceEdgeId?: string;
+    confidence: number;
+    attrs: Record<string, unknown>;
+  }>;
+  related: Array<{
+    nodeId: string;
+    relation: string;
+    confidence: number;
+    attrs: Record<string, unknown>;
+  }>;
+}
+
 export interface DebugNodeRecord {
   id: string;
   kind: string;
@@ -187,6 +247,19 @@ interface IndexRunRow {
   roots_json: string;
   stats_json: string;
   diagnostics_json: string;
+}
+
+export interface SummaryRow {
+  id: string;
+  target_id: string;
+  target_kind: string;
+  summary_path: string;
+  evidence_hash: string;
+  status: string;
+  generated_at: string;
+  updated_at: string;
+  stale: number;
+  evidence_refs_json: string;
 }
 
 interface DebugNodeRow {
@@ -613,6 +686,7 @@ export class SQLiteIndexStore {
       const result = this.db.query(
         `UPDATE summaries
          SET status = 'stale',
+             stale = 1,
              updated_at = $updatedAt
          WHERE target_id = $fileId
             OR target_id = $fileNodeId
@@ -624,6 +698,300 @@ export class SQLiteIndexStore {
       });
       return { summariesMarkedStale: result.changes };
     });
+  }
+
+  readFileHashes(): StorageResult<Map<string, string>> {
+    try {
+      const rows = this.db.query("SELECT id, hash FROM files").all() as Array<{ id: string; hash: string }>;
+      return { ok: true, value: new Map(rows.map((row) => [row.id, row.hash])), diagnostics: [] };
+    } catch (error) {
+      return degradedResult("sqlite.read_file_hashes_failed", "SQLite file hash read failed.", this.path, error);
+    }
+  }
+
+  readFilesAbs(): StorageResult<Array<{ rootName: string; relPath: string; absPath: string }>> {
+    try {
+      const rows = this.db.query(
+        `SELECT r.name AS root_name, f.rel_path AS rel_path, f.abs_path AS abs_path
+         FROM files f
+         JOIN roots r ON r.id = f.root_id`,
+      ).all() as Array<{ root_name: string; rel_path: string; abs_path: string }>;
+      return {
+        ok: true,
+        value: rows.map((row) => ({ rootName: row.root_name, relPath: row.rel_path, absPath: row.abs_path })),
+        diagnostics: [],
+      };
+    } catch (error) {
+      return degradedResult("sqlite.read_files_abs_failed", "SQLite file path read failed.", this.path, error);
+    }
+  }
+
+  persistContracts(input: PersistContractsInput): StorageResult<{ contractsPersisted: number }> {
+    return this.withTransaction("contracts.persist", () => {
+      const seen = new Set<string>();
+      const upsertContract = this.db.query(
+        `INSERT INTO contracts (id, kind, name, root_id, file_id, source_node_id, signature_hash, generated_yaml_path,
+                                status, confidence, attrs_json, updated_at)
+         VALUES ($id, $kind, $name, $rootId, $fileId, $sourceNodeId, $signatureHash, $generatedYamlPath,
+                 'active', $confidence, $attrsJson, $updatedAt)
+         ON CONFLICT(id) DO UPDATE SET
+           kind = excluded.kind,
+           name = excluded.name,
+           root_id = excluded.root_id,
+           file_id = excluded.file_id,
+           source_node_id = excluded.source_node_id,
+           signature_hash = excluded.signature_hash,
+           generated_yaml_path = excluded.generated_yaml_path,
+           status = 'active',
+           confidence = excluded.confidence,
+           attrs_json = excluded.attrs_json,
+           updated_at = excluded.updated_at`,
+      );
+      const deleteConsumers = this.db.query("DELETE FROM contract_consumers WHERE contract_id = $contractId");
+      const deleteRelated = this.db.query("DELETE FROM contract_related_nodes WHERE contract_id = $contractId");
+      const insertConsumer = this.db.query(
+        `INSERT INTO contract_consumers (contract_id, consumer_node_id, consumer_root_id, evidence_edge_id, confidence, attrs_json, updated_at)
+         VALUES ($contractId, $consumerNodeId, $consumerRootId, $evidenceEdgeId, $confidence, $attrsJson, $updatedAt)
+         ON CONFLICT(contract_id, consumer_node_id) DO UPDATE SET
+           consumer_root_id = excluded.consumer_root_id,
+           evidence_edge_id = excluded.evidence_edge_id,
+           confidence = excluded.confidence,
+           attrs_json = excluded.attrs_json,
+           updated_at = excluded.updated_at`,
+      );
+      const insertRelated = this.db.query(
+        `INSERT INTO contract_related_nodes (contract_id, node_id, relation, confidence, attrs_json, updated_at)
+         VALUES ($contractId, $nodeId, $relation, $confidence, $attrsJson, $updatedAt)
+         ON CONFLICT(contract_id, node_id, relation) DO UPDATE SET
+           confidence = excluded.confidence,
+           attrs_json = excluded.attrs_json,
+           updated_at = excluded.updated_at`,
+      );
+
+      try {
+        for (const contract of input.contracts) {
+          seen.add(contract.id);
+          upsertContract.run({
+            id: contract.id,
+            kind: contract.kind,
+            name: contract.name,
+            rootId: contract.rootId,
+            fileId: contract.fileId ?? null,
+            sourceNodeId: contract.sourceNodeId ?? null,
+            signatureHash: contract.signatureHash,
+            generatedYamlPath: contract.generatedYamlPath ?? null,
+            confidence: contract.confidence,
+            attrsJson: JSON.stringify(contract.attrs),
+            updatedAt: input.updatedAt,
+          });
+          deleteConsumers.run({ contractId: contract.id });
+          deleteRelated.run({ contractId: contract.id });
+          for (const consumer of contract.consumers) {
+            insertConsumer.run({
+              contractId: contract.id,
+              consumerNodeId: consumer.consumerNodeId,
+              consumerRootId: consumer.consumerRootId,
+              evidenceEdgeId: consumer.evidenceEdgeId ?? null,
+              confidence: consumer.confidence,
+              attrsJson: JSON.stringify(consumer.attrs),
+              updatedAt: input.updatedAt,
+            });
+          }
+          for (const related of contract.related) {
+            insertRelated.run({
+              contractId: contract.id,
+              nodeId: related.nodeId,
+              relation: related.relation,
+              confidence: related.confidence,
+              attrsJson: JSON.stringify(related.attrs),
+              updatedAt: input.updatedAt,
+            });
+          }
+        }
+
+        const existing = this.db.query("SELECT id FROM contracts").all() as Array<{ id: string }>;
+        const stale = existing.map((row) => row.id).filter((id) => !seen.has(id));
+        if (stale.length > 0) {
+          const deleteContract = this.db.query("DELETE FROM contracts WHERE id = $id");
+          try {
+            for (const id of stale) deleteContract.run({ id });
+          } finally {
+            finalizeStatement(deleteContract);
+          }
+        }
+      } finally {
+        finalizeStatement(upsertContract);
+        finalizeStatement(deleteConsumers);
+        finalizeStatement(deleteRelated);
+        finalizeStatement(insertConsumer);
+        finalizeStatement(insertRelated);
+      }
+
+      return { contractsPersisted: input.contracts.length };
+    });
+  }
+
+  readSummaryByTarget(input: { targetId: string; targetKind: string }): StorageResult<SummaryRow | undefined> {
+    try {
+      const row = this.db.query(
+        `SELECT id, target_id, target_kind, summary_path, evidence_hash, status, generated_at, updated_at, stale, evidence_refs_json
+         FROM summaries
+         WHERE target_id = $targetId AND target_kind = $targetKind`,
+      ).get({ targetId: input.targetId, targetKind: input.targetKind }) as SummaryRow | null;
+      return { ok: true, value: row ?? undefined, diagnostics: [] };
+    } catch (error) {
+      return degradedResult("sqlite.read_summary_failed", "SQLite summaries read failed.", this.path, error);
+    }
+  }
+
+  readSummariesTotal(): StorageResult<number> {
+    try {
+      const row = this.db.query("SELECT COUNT(*) AS count FROM summaries").get() as { count: number };
+      return { ok: true, value: row.count, diagnostics: [] };
+    } catch (error) {
+      return degradedResult("sqlite.read_summaries_total_failed", "SQLite summaries total failed.", this.path, error);
+    }
+  }
+
+  readStaleSummaries(): StorageResult<SummaryRow[]> {
+    try {
+      const rows = this.db.query(
+        `SELECT id, target_id, target_kind, summary_path, evidence_hash, status, generated_at, updated_at, stale, evidence_refs_json
+         FROM summaries
+         WHERE stale = 1 OR status = 'stale'
+         ORDER BY target_id ASC`,
+      ).all() as SummaryRow[];
+      return { ok: true, value: rows, diagnostics: [] };
+    } catch (error) {
+      return degradedResult("sqlite.read_stale_summaries_failed", "SQLite stale summaries read failed.", this.path, error);
+    }
+  }
+
+  upsertSummary(input: {
+    id: string;
+    targetId: string;
+    targetKind: string;
+    summaryPath: string;
+    evidenceHash: string;
+    evidenceRefsJson: string;
+    generatedAt: string;
+    updatedAt: string;
+  }): StorageResult<void> {
+    return this.withTransaction("summaries.upsert", () => {
+      this.db.query(
+        `INSERT INTO summaries (id, target_id, target_kind, summary_path, evidence_hash, status, generated_at, updated_at, stale, evidence_refs_json)
+         VALUES ($id, $targetId, $targetKind, $summaryPath, $evidenceHash, 'fresh', $generatedAt, $updatedAt, 0, $evidenceRefsJson)
+         ON CONFLICT(id) DO UPDATE SET
+           target_id = excluded.target_id,
+           target_kind = excluded.target_kind,
+           summary_path = excluded.summary_path,
+           evidence_hash = excluded.evidence_hash,
+           status = 'fresh',
+           generated_at = excluded.generated_at,
+           updated_at = excluded.updated_at,
+           stale = 0,
+           evidence_refs_json = excluded.evidence_refs_json`,
+      ).run({
+        id: input.id,
+        targetId: input.targetId,
+        targetKind: input.targetKind,
+        summaryPath: input.summaryPath,
+        evidenceHash: input.evidenceHash,
+        evidenceRefsJson: input.evidenceRefsJson,
+        generatedAt: input.generatedAt,
+        updatedAt: input.updatedAt,
+      });
+      return undefined;
+    });
+  }
+
+  readContracts(): StorageResult<DebugContractRecord[]> {
+    try {
+      const rows = this.db.query(
+        `SELECT c.id, c.kind, c.name, c.root_id, r.name AS root_name, c.file_id, f.rel_path,
+                c.source_node_id, c.signature_hash, c.generated_yaml_path, c.status, c.confidence,
+                c.attrs_json
+         FROM contracts c
+         LEFT JOIN roots r ON r.id = c.root_id
+         LEFT JOIN files f ON f.id = c.file_id`,
+      ).all() as Array<{
+        id: string;
+        kind: string;
+        name: string;
+        root_id: string;
+        root_name: string | null;
+        file_id: string | null;
+        rel_path: string | null;
+        source_node_id: string | null;
+        signature_hash: string;
+        generated_yaml_path: string | null;
+        status: string;
+        confidence: number;
+        attrs_json: string;
+      }>;
+      const consumers = this.db.query(
+        "SELECT contract_id, consumer_node_id, consumer_root_id, evidence_edge_id, confidence, attrs_json FROM contract_consumers",
+      ).all() as Array<{
+        contract_id: string;
+        consumer_node_id: string;
+        consumer_root_id: string;
+        evidence_edge_id: string | null;
+        confidence: number;
+        attrs_json: string;
+      }>;
+      const related = this.db.query(
+        "SELECT contract_id, node_id, relation, confidence, attrs_json FROM contract_related_nodes",
+      ).all() as Array<{
+        contract_id: string;
+        node_id: string;
+        relation: string;
+        confidence: number;
+        attrs_json: string;
+      }>;
+      const consumerMap = new Map<string, DebugContractRecord["consumers"]>();
+      for (const item of consumers) {
+        const list = consumerMap.get(item.contract_id) ?? [];
+        list.push({
+          consumerNodeId: item.consumer_node_id,
+          consumerRootId: item.consumer_root_id,
+          evidenceEdgeId: item.evidence_edge_id ?? undefined,
+          confidence: item.confidence,
+          attrs: parseObject(item.attrs_json),
+        });
+        consumerMap.set(item.contract_id, list);
+      }
+      const relatedMap = new Map<string, DebugContractRecord["related"]>();
+      for (const item of related) {
+        const list = relatedMap.get(item.contract_id) ?? [];
+        list.push({
+          nodeId: item.node_id,
+          relation: item.relation,
+          confidence: item.confidence,
+          attrs: parseObject(item.attrs_json),
+        });
+        relatedMap.set(item.contract_id, list);
+      }
+      const contracts = rows.map((row): DebugContractRecord => ({
+        id: row.id,
+        kind: row.kind,
+        name: row.name,
+        rootId: row.root_id,
+        rootName: row.root_name ?? "",
+        fileId: row.file_id ?? undefined,
+        relPath: row.rel_path ?? undefined,
+        sourceNodeId: row.source_node_id ?? undefined,
+        signatureHash: row.signature_hash,
+        generatedYamlPath: row.generated_yaml_path ?? undefined,
+        status: row.status,
+        confidence: row.confidence,
+        attrs: parseObject(row.attrs_json),
+        consumers: (consumerMap.get(row.id) ?? []).sort((a, b) => a.consumerNodeId.localeCompare(b.consumerNodeId)),
+        related: (relatedMap.get(row.id) ?? []).sort((a, b) => a.nodeId.localeCompare(b.nodeId)),
+      })).sort((a, b) => a.id.localeCompare(b.id));
+      return { ok: true, value: contracts, diagnostics: [] };
+    } catch (error) {
+      return degradedResult("sqlite.read_contracts_failed", "SQLite contracts read failed.", this.path, error);
+    }
   }
 
   recomputeResolverFacts(updatedAt: string): StorageResult<{ edgesPersisted: number; unresolvedPersisted: number }> {

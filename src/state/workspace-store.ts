@@ -74,7 +74,16 @@ export class WorkspaceStore {
   readonly reindexQueuePath: string;
   readonly memoryDir: string;
   readonly memoryRootsDir: string;
+  readonly memoryContractsDir: string;
+  readonly memorySymbolsDir: string;
   readonly packsDir: string;
+  readonly contractsDir: string;
+  readonly contractsGeneratedDir: string;
+  readonly stateFilesDir: string;
+  readonly touchedNodesPath: string;
+  readonly pendingValidationsPath: string;
+  readonly staleSummariesPath: string;
+  readonly impactLedgerPath: string;
 
   constructor(ctx: PluginInput, options: ContextBridgeOptions) {
     this.ctx = ctx;
@@ -96,7 +105,16 @@ export class WorkspaceStore {
     this.reindexQueuePath = path.join(this.queueDir, "reindex.jsonl");
     this.memoryDir = path.join(this.stateDirAbs, "memory");
     this.memoryRootsDir = path.join(this.memoryDir, "roots");
+    this.memoryContractsDir = path.join(this.memoryDir, "contracts");
+    this.memorySymbolsDir = path.join(this.memoryDir, "symbols");
     this.packsDir = path.join(this.stateDirAbs, "packs");
+    this.contractsDir = path.join(this.stateDirAbs, "contracts");
+    this.contractsGeneratedDir = path.join(this.contractsDir, "generated");
+    this.stateFilesDir = path.join(this.stateDirAbs, "state");
+    this.touchedNodesPath = path.join(this.stateFilesDir, "touched_nodes.json");
+    this.pendingValidationsPath = path.join(this.stateFilesDir, "pending_validations.jsonl");
+    this.staleSummariesPath = path.join(this.stateFilesDir, "stale_summaries.json");
+    this.impactLedgerPath = path.join(this.stateFilesDir, "impact_ledger.jsonl");
   }
 
   async init(): Promise<void> {
@@ -106,7 +124,11 @@ export class WorkspaceStore {
     await mkdir(this.logsDir, { recursive: true });
     await mkdir(this.queueDir, { recursive: true });
     await mkdir(this.memoryRootsDir, { recursive: true });
+    await mkdir(this.memoryContractsDir, { recursive: true });
+    await mkdir(this.memorySymbolsDir, { recursive: true });
     await mkdir(this.packsDir, { recursive: true });
+    await mkdir(this.contractsGeneratedDir, { recursive: true });
+    await mkdir(this.stateFilesDir, { recursive: true });
     if (!existsSync(this.manifestPath)) {
       const primary: RootSpec = {
         name: "primary",
@@ -244,6 +266,34 @@ export class WorkspaceStore {
     if (!found) return false;
     const manifest = await this.readManifest();
     return manifest.policies.contractGlobs.some((pattern) => globishMatch(pattern, found.relPath));
+  }
+
+  async contractGlobMatcher(): Promise<(relPath: string) => boolean> {
+    const manifest = await this.readManifest();
+    const globs = manifest.policies.contractGlobs;
+    return (relPath: string) => globs.some((pattern) => globishMatch(pattern, relPath));
+  }
+
+  async contractIdsForAbsPath(absPath: string): Promise<string[]> {
+    if (!existsSync(this.sqlitePath)) return [];
+    const opened = await openSQLiteIndexStore(this.sqlitePath, { readonly: true, skipMigrations: true });
+    if (!opened.ok) return [];
+    try {
+      const contracts = opened.value.readContracts();
+      const files = opened.value.readFilesAbs();
+      if (!contracts.ok || !files.ok) return [];
+      const absIndex = new Map<string, string>();
+      for (const file of files.value) absIndex.set(`${file.rootName}:${file.relPath}`, file.absPath);
+      const matches: string[] = [];
+      for (const contract of contracts.value) {
+        if (!contract.relPath) continue;
+        const abs = absIndex.get(`${contract.rootName}:${contract.relPath}`);
+        if (abs && abs === absPath) matches.push(contract.id);
+      }
+      return matches;
+    } finally {
+      opened.value.close();
+    }
   }
 
   async appendLedger(entry: Record<string, unknown>): Promise<void> {

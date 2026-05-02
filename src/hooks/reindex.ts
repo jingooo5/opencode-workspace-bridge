@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { WorkspaceStore } from "../state/workspace-store.js";
 import { log } from "../shared/log.js";
+import { syncStaleSummaries } from "../state/edit-state.js";
 
 export interface ReindexHookMeta {
   eventType?: string;
@@ -22,6 +23,7 @@ export async function markStaleAndQueuePath(
 
   await store.markStaleByAbsPath(absPath);
   await store.markSummariesStaleByAbsPath(absPath);
+  await syncStaleSummaries(store);
 
   const queued = await store.appendReindexQueueByAbsPath(absPath, reason, meta);
   if (!queued.ok && "skipped" in queued) return;

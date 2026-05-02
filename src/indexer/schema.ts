@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const INDEX_SCHEMA_VERSION = 1;
+export const INDEX_SCHEMA_VERSION = 2;
 
 export class UnsupportedSchemaVersionError extends Error {
   constructor(readonly actualVersion: number, readonly supportedVersion: number) {
@@ -131,6 +131,44 @@ const TABLE_STATEMENTS = [
     stats_json TEXT NOT NULL DEFAULT '{}',
     diagnostics_json TEXT NOT NULL DEFAULT '[]'
   )`,
+  `CREATE TABLE IF NOT EXISTS contracts (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    file_id TEXT,
+    source_node_id TEXT,
+    version TEXT,
+    signature_hash TEXT NOT NULL,
+    generated_yaml_path TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    attrs_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(root_id) REFERENCES roots(id) ON DELETE CASCADE,
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE SET NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS contract_consumers (
+    contract_id TEXT NOT NULL,
+    consumer_node_id TEXT NOT NULL,
+    consumer_root_id TEXT NOT NULL,
+    evidence_edge_id TEXT,
+    confidence REAL NOT NULL DEFAULT 0.8,
+    attrs_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(contract_id, consumer_node_id),
+    FOREIGN KEY(contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS contract_related_nodes (
+    contract_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0.7,
+    attrs_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(contract_id, node_id, relation),
+    FOREIGN KEY(contract_id) REFERENCES contracts(id) ON DELETE CASCADE
+  )`,
 ] as const;
 
 const INDEX_STATEMENTS = [
@@ -145,7 +183,12 @@ const INDEX_STATEMENTS = [
   "CREATE INDEX IF NOT EXISTS idx_spans_file ON spans(file_id)",
   "CREATE INDEX IF NOT EXISTS idx_unresolved_root_kind ON unresolved(root_id, kind)",
   "CREATE INDEX IF NOT EXISTS idx_summaries_target ON summaries(target_id, target_kind)",
+  "CREATE INDEX IF NOT EXISTS idx_summaries_stale ON summaries(stale)",
   "CREATE INDEX IF NOT EXISTS idx_index_runs_started_at ON index_runs(started_at)",
+  "CREATE INDEX IF NOT EXISTS idx_contracts_root_kind ON contracts(root_id, kind)",
+  "CREATE INDEX IF NOT EXISTS idx_contracts_file ON contracts(file_id)",
+  "CREATE INDEX IF NOT EXISTS idx_contract_consumers_node ON contract_consumers(consumer_node_id)",
+  "CREATE INDEX IF NOT EXISTS idx_contract_related_node ON contract_related_nodes(node_id)",
 ] as const;
 
 const REQUIRED_COLUMNS: Record<string, ReadonlyArray<{ name: string; definition: string }>> = {
@@ -227,6 +270,8 @@ const REQUIRED_COLUMNS: Record<string, ReadonlyArray<{ name: string; definition:
     { name: "status", definition: "TEXT" },
     { name: "generated_at", definition: "TEXT" },
     { name: "updated_at", definition: "TEXT" },
+    { name: "stale", definition: "INTEGER NOT NULL DEFAULT 0" },
+    { name: "evidence_refs_json", definition: "TEXT NOT NULL DEFAULT '[]'" },
   ],
   index_runs: [
     { name: "id", definition: "TEXT" },
@@ -236,6 +281,38 @@ const REQUIRED_COLUMNS: Record<string, ReadonlyArray<{ name: string; definition:
     { name: "roots_json", definition: "TEXT DEFAULT '[]'" },
     { name: "stats_json", definition: "TEXT DEFAULT '{}'" },
     { name: "diagnostics_json", definition: "TEXT DEFAULT '[]'" },
+  ],
+  contracts: [
+    { name: "id", definition: "TEXT" },
+    { name: "kind", definition: "TEXT" },
+    { name: "name", definition: "TEXT" },
+    { name: "root_id", definition: "TEXT" },
+    { name: "file_id", definition: "TEXT" },
+    { name: "source_node_id", definition: "TEXT" },
+    { name: "version", definition: "TEXT" },
+    { name: "signature_hash", definition: "TEXT" },
+    { name: "generated_yaml_path", definition: "TEXT" },
+    { name: "status", definition: "TEXT DEFAULT 'active'" },
+    { name: "confidence", definition: "REAL DEFAULT 1.0" },
+    { name: "attrs_json", definition: "TEXT DEFAULT '{}'" },
+    { name: "updated_at", definition: "TEXT" },
+  ],
+  contract_consumers: [
+    { name: "contract_id", definition: "TEXT" },
+    { name: "consumer_node_id", definition: "TEXT" },
+    { name: "consumer_root_id", definition: "TEXT" },
+    { name: "evidence_edge_id", definition: "TEXT" },
+    { name: "confidence", definition: "REAL DEFAULT 0.8" },
+    { name: "attrs_json", definition: "TEXT DEFAULT '{}'" },
+    { name: "updated_at", definition: "TEXT" },
+  ],
+  contract_related_nodes: [
+    { name: "contract_id", definition: "TEXT" },
+    { name: "node_id", definition: "TEXT" },
+    { name: "relation", definition: "TEXT" },
+    { name: "confidence", definition: "REAL DEFAULT 0.7" },
+    { name: "attrs_json", definition: "TEXT DEFAULT '{}'" },
+    { name: "updated_at", definition: "TEXT" },
   ],
   schema_meta: [
     { name: "key", definition: "TEXT" },

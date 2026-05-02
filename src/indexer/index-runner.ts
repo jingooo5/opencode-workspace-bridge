@@ -16,6 +16,7 @@ import type { RootSpec } from "../types.js";
 import { extractTsJsFacts, mergeFacts } from "./extractors/ts-js.js";
 import { extractPackageFacts } from "./extractors/package.js";
 import { extractPythonFacts } from "./extractors/python.js";
+import { buildAndPersistContracts } from "./contracts/builder.js";
 
 export type IndexTarget =
   | { type: "workspace"; maxFiles?: number; reason?: string }
@@ -163,6 +164,33 @@ export async function runIndex(store: WorkspaceStore, target: IndexTarget): Prom
       degraded = true;
       sqliteWritable = false;
       diagnostics.push(writeSkipDiagnostic("recomputeResolverFacts", store.sqlitePath));
+    }
+  }
+
+  if (sqliteStore && sqliteWritable) {
+    try {
+      const matcher = await store.contractGlobMatcher();
+      const contracts = await buildAndPersistContracts(sqliteStore, {
+        updatedAt: startedAt,
+        contractsGeneratedDir: store.contractsGeneratedDir,
+        contractGlobMatcher: matcher,
+      });
+      if (!contracts.ok) {
+        diagnostics.push(...contracts.diagnostics);
+        degraded = true;
+        sqliteWritable = false;
+        diagnostics.push(writeSkipDiagnostic("buildContractRegistry", store.sqlitePath));
+      }
+    } catch (error) {
+      diagnostics.push({
+        level: "error",
+        code: "indexer.contract_build_failed",
+        message: "Contract registry build failed.",
+        path: store.contractsGeneratedDir,
+        cause: error instanceof Error ? error.message : String(error),
+      });
+      degraded = true;
+      sqliteWritable = false;
     }
   }
 

@@ -18,6 +18,9 @@ import {
   type StorageDiagnostic,
 } from "../indexer/sqlite-store.js";
 import { INDEX_SCHEMA_VERSION } from "../indexer/schema.js";
+import { createSummarizeTool } from "./ctx-summarize.js";
+import { buildPackExtension, writePackMarkdownSibling } from "./ctx-pack-extension.js";
+import { buildImpactExtension } from "./ctx-impact-extension.js";
 
 // Use the plugin's own zod instance so schemas are guaranteed compatible with
 // the runtime that ultimately consumes tool definitions.
@@ -172,6 +175,7 @@ export function createContextTools(
         const staleRoots = manifest.roots
           .filter((root) => root.stale || !root.indexedAt)
           .map((root) => root.name);
+        const { contractCounts, memoryCounts } = await readRegistryCounts(store);
         return JSON.stringify(
           {
             version: "v0.1",
@@ -196,6 +200,8 @@ export function createContextTools(
               staleRoots,
             },
             sqlite: sqliteStatus(sqlite),
+            contracts: contractCounts,
+            memory: memoryCounts,
             recentLedger: recent.map(parseLedgerLine),
             notes: [
               sqlite.available
@@ -319,21 +325,23 @@ export function createContextTools(
 
     ctx_pack: tool({
       description:
-        "Create a task-specific context pack from the multi-root evidence index. Use before cross-repo edits, DTO/API changes, or debugging distributed flows.",
+        "Create a task-specific context pack from the multi-root evidence index. Includes promoted contracts, semantic memory, edit focus, and suggested edit order. Writes a paired Markdown rendering for human review.",
       args: {
         task: z.string().min(1).describe("Natural language task description."),
         roots: z.array(z.string()).optional(),
         limit: z.number().int().positive().optional(),
       },
-      async execute(args) {
+      async execute(args, context) {
         await ensureIndexReady(store, options);
         const sqlite = await readSQLiteToolEvidence(store);
+        const sessionID = readSessionID(context);
         const pack = await createPack(
           store,
           args.task,
           args.roots,
           args.limit ?? 12,
           sqlite,
+          sessionID,
         );
         return JSON.stringify(pack, null, 2);
       },
@@ -431,9 +439,11 @@ export function createContextTools(
       },
     }),
 
+    ctx_summarize: createSummarizeTool(store),
+
     ctx_impact: tool({
       description:
-        "V0.1 lightweight impact analysis for a root:path, symbol, DTO, API, or search phrase. Produces evidence-backed candidate impacts.",
+        "Impact analysis for a root:path, symbol, DTO, API, or contract id. Produces evidence-backed candidate impacts, contract membership, and required validation gates. Appends a row to state/impact_ledger.jsonl.",
       args: {
         target: z
           .string()
@@ -443,7 +453,7 @@ export function createContextTools(
           ),
         limit: z.number().int().positive().optional(),
       },
-      async execute(args) {
+      async execute(args, context) {
         await ensureIndexReady(store, options);
         const sqlite = await readSQLiteToolEvidence(store);
         const sqliteEntries = sqlite.available ? sqliteIndexEntries(sqlite) : [];
@@ -461,12 +471,24 @@ export function createContextTools(
           hits.map((hit) => hit.path),
         );
         const roots = Array.from(new Set(hits.map((hit) => hit.root)));
+        const sessionID = readSessionID(context);
+        const evidenceCounts = {
+          direct: graphImpact.directEvidence.length,
+          crossRoot: graphImpact.crossRootEvidence.length,
+          unknown: graphImpact.unknownEvidence.length,
+        };
+        const extension = await buildImpactExtension(store, {
+          target: args.target,
+          sessionID,
+          evidenceCounts,
+        });
         await store.appendLedger({
           type: "impact.analysis",
           target: args.target,
           hits: hits.length,
           roots,
           risks,
+          contractIds: extension.contractIds,
         });
         return JSON.stringify(
           {
@@ -480,8 +502,11 @@ export function createContextTools(
             graphWarnings: graphImpact.warnings,
             sqlite: sqliteReport(sqlite),
             risks,
+            contractIds: extension.contractIds,
+            requiredGates: extension.requiredGates,
+            pendingGates: extension.pendingGates,
             unknowns: dedupeStrings([
-              "V0.1 uses lightweight text/symbol evidence; REST/OpenAPI/proto structural matching arrives in v0.2+.",
+              "Required gates marked 'review' indicate v0.2 has no structural OpenAPI/proto parser; verify manually.",
               "Low or missing evidence should be confirmed with ctx_read and targeted search.",
               ...graphImpact.unknowns,
             ]),
@@ -506,6 +531,7 @@ async function createPack(
   roots: string[] | undefined,
   limit: number,
   sqlite?: SQLiteToolEvidence,
+  sessionID?: string,
 ): Promise<Record<string, unknown>> {
   const sqliteEvidence = sqlite ?? await readSQLiteToolEvidence(store);
   const sqliteEntries = sqliteEvidence.available ? sqliteIndexEntries(sqliteEvidence) : [];
@@ -518,6 +544,13 @@ async function createPack(
     hits.map((hit) => hit.path),
   );
   const graph = graphPackEvidence(sqliteEvidence, task, roots, limit, hits);
+  const extension = await buildPackExtension(store, {
+    task,
+    roots,
+    limit,
+    sessionID,
+    hits: hits.map((hit) => ({ root: hit.root, path: hit.path, ref: hit.ref, text: hit.text })),
+  });
   const pack = {
     task,
     workspace: summary,
@@ -527,6 +560,10 @@ async function createPack(
     unknowns: graph.unknowns,
     warnings: graph.warnings,
     risks: riskHints,
+    contracts: extension.contracts,
+    memory: extension.memory,
+    editFocus: extension.editFocus,
+    suggestedEditOrder: extension.suggestedEditOrder,
     suggestedNext: [
       "Inspect the top evidence refs with ctx_read.",
       "If editing contract/DTO/schema files, run ctx_impact or ask ctx-impact-analyst first.",
@@ -542,14 +579,13 @@ async function createPack(
       .replace(/^-|-$/g, "")
       .slice(0, 60) || "pack";
   await mkdir(path.join(store.stateDirAbs, "packs"), { recursive: true });
-  await Bun.write(
-    path.join(
-      store.stateDirAbs,
-      "packs",
-      `${Date.now()}-${safeName}.json`,
-    ),
-    JSON.stringify(pack, null, 2),
-  );
+  const jsonPath = path.join(store.stateDirAbs, "packs", `${Date.now()}-${safeName}.json`);
+  await Bun.write(jsonPath, JSON.stringify(pack, null, 2));
+  await writePackMarkdownSibling(store, jsonPath, {
+    task,
+    result: extension,
+    evidence: hits.map((hit) => ({ ref: hit.ref, line: hit.line, text: hit.text })),
+  });
   await store.appendLedger({
     type: "context.pack",
     task,
@@ -1461,4 +1497,53 @@ async function readJsonFile(filePath: string): Promise<Record<string, unknown> |
 
 function dedupeStrings(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+async function readRegistryCounts(store: WorkspaceStore): Promise<{
+  contractCounts: { available: boolean; total: number; byKind: Record<string, number> };
+  memoryCounts: { available: boolean; total: number; stale: number };
+}> {
+  const empty = {
+    contractCounts: { available: false, total: 0, byKind: {} },
+    memoryCounts: { available: false, total: 0, stale: 0 },
+  };
+  if (!existsSync(store.sqlitePath)) return empty;
+  const opened = await openSQLiteIndexStore(store.sqlitePath, { readonly: true, skipMigrations: true });
+  if (!opened.ok) return empty;
+  try {
+    const contracts = opened.value.readContracts();
+    const stale = opened.value.readStaleSummaries();
+    const byKind: Record<string, number> = {};
+    let contractTotal = 0;
+    if (contracts.ok) {
+      for (const contract of contracts.value) {
+        byKind[contract.kind] = (byKind[contract.kind] ?? 0) + 1;
+        contractTotal += 1;
+      }
+    }
+    const staleCount = stale.ok ? stale.value.length : 0;
+    const totalSummaries = countTotalSummaries(opened.value);
+    return {
+      contractCounts: { available: true, total: contractTotal, byKind },
+      memoryCounts: { available: true, total: totalSummaries, stale: staleCount },
+    };
+  } finally {
+    opened.value.close();
+  }
+}
+
+function countTotalSummaries(sqlite: import("../indexer/sqlite-store.js").SQLiteIndexStore): number {
+  // Reuse readStaleSummaries against a flag-free filter via direct readContract to keep typing strict.
+  // We piggy-back on readContracts only for total contracts; summaries total comes from a small inline query.
+  const result = sqlite.readSummariesTotal?.();
+  if (result?.ok) return result.value;
+  return 0;
+}
+
+function readSessionID(context: unknown): string | undefined {
+  if (!context || typeof context !== "object") return undefined;
+  const record = context as Record<string, unknown>;
+  if (typeof record.sessionID === "string") return record.sessionID;
+  if (typeof record.sessionId === "string") return record.sessionId;
+  return undefined;
 }

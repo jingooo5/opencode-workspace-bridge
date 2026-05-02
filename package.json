@@ -1,6 +1,6 @@
 {
   "name": "opencode-context-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Multi-root workspace context orchestration plugin for opencode.",
   "bin": {
@@ -13,7 +13,7 @@
     }
   },
   "scripts": {
-    "test": "bun test tests/indexer-v0-1.smoke.test.ts",
+    "test": "bun test tests/",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist"
