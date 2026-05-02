@@ -2,6 +2,7 @@ import path from "node:path";
 import type { Hooks } from "@opencode-ai/plugin";
 import type { WorkspaceStore } from "../state/workspace-store.js";
 import type { SessionState } from "../state/session-state.js";
+import { extractValidationCommand, markStaleAndQueuePath } from "./reindex.js";
 
 const EDIT_TOOLS = new Set(["write", "edit", "apply_patch"]);
 const READ_TOOLS = new Set(["read"]);
@@ -36,6 +37,21 @@ export function createSafetyHooks(store: WorkspaceStore, sessions: SessionState)
     },
 
     "tool.execute.after": async (input) => {
+      if (input.tool === "ctx_impact") {
+        await store.appendLedger({ type: "impact.analysis.requested", sessionID: input.sessionID, tool: input.tool });
+      }
+
+      const validation = extractValidationCommand(input.tool, input.args);
+      if (validation) {
+        await store.appendLedger({
+          type: "validation.command",
+          sessionID: input.sessionID,
+          tool: input.tool,
+          validationKind: validation.kind,
+          command: validation.command,
+        });
+      }
+
       if (!EDIT_TOOLS.has(input.tool)) return;
       const paths = extractCandidatePaths(input.args);
       for (const candidate of paths) {
@@ -43,7 +59,11 @@ export function createSafetyHooks(store: WorkspaceStore, sessions: SessionState)
         const found = await store.findRootByPath(abs);
         if (!found) continue;
         sessions.touch(input.sessionID, `${found.root.name}:${found.relPath}`);
-        await store.markStaleByAbsPath(abs);
+        await markStaleAndQueuePath(store, abs, "tool_edited", {
+          eventType: "tool.execute.after",
+          sessionID: input.sessionID,
+          sourceTool: input.tool,
+        });
         await store.appendLedger({ type: "file.touched", sessionID: input.sessionID, tool: input.tool, ref: `${found.root.name}:${found.relPath}` });
       }
     },

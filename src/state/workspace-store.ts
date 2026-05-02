@@ -1,7 +1,9 @@
 import path from "node:path";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import type { PluginInput } from "@opencode-ai/plugin";
+import { openSQLiteIndexStore } from "../indexer/sqlite-store.js";
+import { fileIdOf } from "../indexer/scanner.js";
 import {
   WorkspaceManifestSchema,
   type AccessMode,
@@ -11,6 +13,47 @@ import {
 } from "../types.js";
 import { globishMatch, isInside, parseRef, refOf, slugify, toAbs, toRelOrAbs } from "../shared/path.js";
 
+interface ReindexQueueEntry {
+  dedupeKey: string;
+  path: string;
+  reason: string;
+  ref: string;
+  root: string;
+  timestamp: string;
+  eventType?: string;
+  sessionID?: string;
+  tool?: string;
+}
+
+interface LedgerEntry {
+  at?: string;
+  command?: string;
+  eventType?: string;
+  path?: string;
+  ref?: string;
+  refs?: string[];
+  root?: string;
+  sessionID?: string;
+  tool?: string;
+  type?: string;
+  validationKind?: string;
+}
+
+interface IndexRunEntry {
+  diagnostics?: unknown[];
+  finishedAt?: string;
+  id?: string;
+  reason?: string;
+  roots?: string[];
+  startedAt?: string;
+  stats?: Record<string, unknown>;
+}
+
+interface CompactionContextInput {
+  sessionID?: string;
+  touchedRefs: string[];
+}
+
 export class WorkspaceStore {
   readonly ctx: PluginInput;
   readonly options: ContextBridgeOptions;
@@ -18,6 +61,20 @@ export class WorkspaceStore {
   readonly manifestPath: string;
   readonly indexPath: string;
   readonly ledgerPath: string;
+  readonly sqlitePath: string;
+  readonly evidenceDir: string;
+  readonly evidenceNodesPath: string;
+  readonly evidenceEdgesPath: string;
+  readonly evidenceSpansPath: string;
+  readonly diagnosticsDir: string;
+  readonly indexerDiagnosticsPath: string;
+  readonly logsDir: string;
+  readonly indexRunsLogPath: string;
+  readonly queueDir: string;
+  readonly reindexQueuePath: string;
+  readonly memoryDir: string;
+  readonly memoryRootsDir: string;
+  readonly packsDir: string;
 
   constructor(ctx: PluginInput, options: ContextBridgeOptions) {
     this.ctx = ctx;
@@ -26,10 +83,30 @@ export class WorkspaceStore {
     this.manifestPath = path.join(this.stateDirAbs, "workspace.json");
     this.indexPath = path.join(this.stateDirAbs, "index.jsonl");
     this.ledgerPath = path.join(this.stateDirAbs, "task-history.jsonl");
+    this.sqlitePath = path.join(this.stateDirAbs, "index.sqlite");
+    this.evidenceDir = path.join(this.stateDirAbs, "evidence");
+    this.evidenceNodesPath = path.join(this.evidenceDir, "nodes.jsonl");
+    this.evidenceEdgesPath = path.join(this.evidenceDir, "edges.jsonl");
+    this.evidenceSpansPath = path.join(this.evidenceDir, "spans.jsonl");
+    this.diagnosticsDir = path.join(this.stateDirAbs, "diagnostics");
+    this.indexerDiagnosticsPath = path.join(this.diagnosticsDir, "indexer.jsonl");
+    this.logsDir = path.join(this.stateDirAbs, "logs");
+    this.indexRunsLogPath = path.join(this.logsDir, "index-runs.jsonl");
+    this.queueDir = path.join(this.stateDirAbs, "queue");
+    this.reindexQueuePath = path.join(this.queueDir, "reindex.jsonl");
+    this.memoryDir = path.join(this.stateDirAbs, "memory");
+    this.memoryRootsDir = path.join(this.memoryDir, "roots");
+    this.packsDir = path.join(this.stateDirAbs, "packs");
   }
 
   async init(): Promise<void> {
     await mkdir(this.stateDirAbs, { recursive: true });
+    await mkdir(this.evidenceDir, { recursive: true });
+    await mkdir(this.diagnosticsDir, { recursive: true });
+    await mkdir(this.logsDir, { recursive: true });
+    await mkdir(this.queueDir, { recursive: true });
+    await mkdir(this.memoryRootsDir, { recursive: true });
+    await mkdir(this.packsDir, { recursive: true });
     if (!existsSync(this.manifestPath)) {
       const primary: RootSpec = {
         name: "primary",
@@ -170,12 +247,7 @@ export class WorkspaceStore {
   }
 
   async appendLedger(entry: Record<string, unknown>): Promise<void> {
-    await mkdir(path.dirname(this.ledgerPath), { recursive: true });
-    await writeFile(
-      this.ledgerPath,
-      `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
-      { flag: "a", encoding: "utf8" },
-    );
+    await this.appendJsonl(this.ledgerPath, { at: new Date().toISOString(), ...entry });
   }
 
   async recentLedger(limit = 30): Promise<string[]> {
@@ -196,4 +268,218 @@ export class WorkspaceStore {
   refOf(root: RootSpec, relPath: string): string {
     return refOf(root.name, relPath);
   }
+
+  async appendReindexQueueByAbsPath(
+    absPath: string,
+    reason: string,
+    meta: { eventType?: string; sessionID?: string; sourceTool?: string } = {},
+  ): Promise<{ ok: true; entry: ReindexQueueEntry } | { ok: false; error: string } | { ok: false; skipped: true }> {
+    const found = await this.findRootByPath(absPath);
+    if (!found) return { ok: false, skipped: true };
+
+    const entry: ReindexQueueEntry = {
+      timestamp: new Date().toISOString(),
+      root: found.root.name,
+      ref: this.refOf(found.root, found.relPath),
+      path: found.relPath,
+      reason,
+      dedupeKey: `${found.root.name}:${found.relPath}:${reason}`,
+      eventType: meta.eventType,
+      sessionID: meta.sessionID,
+      tool: meta.sourceTool,
+    };
+
+    try {
+      await this.appendJsonl(this.reindexQueuePath, entry);
+      return { ok: true, entry };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async markSummariesStaleByAbsPath(absPath: string): Promise<void> {
+    if (!existsSync(this.sqlitePath)) return;
+    const found = await this.findRootByPath(absPath);
+    if (!found) return;
+
+    const opened = await openSQLiteIndexStore(this.sqlitePath);
+    if (!opened.ok) return;
+
+    try {
+      opened.value.markSummariesStaleForFile({
+        fileId: fileIdOf(found.root.name, found.relPath),
+      });
+    } finally {
+      opened.value.close();
+    }
+  }
+
+  async compactionContext(input: CompactionContextInput): Promise<string> {
+    const manifest = await this.readManifest();
+    const activeRoots = manifest.roots.length
+      ? manifest.roots
+          .map((root) => {
+            const status = root.stale ? "stale" : root.indexedAt ? `indexed ${root.indexedAt}` : "missing index";
+            return `- ${root.name}: ${root.path} (${root.access}, ${root.role ?? "unknown"}, ${status})`;
+          })
+          .join("\n")
+      : "- none";
+
+    const lastIndexRun = await this.lastIndexRunSummary();
+    const staleWarnings = manifest.roots.filter((root) => root.stale || !root.indexedAt);
+    const staleWarningLines = staleWarnings.length
+      ? staleWarnings
+          .map((root) => `- ${root.name}: ${root.stale ? "stale" : "missing indexedAt"}`)
+          .join("\n")
+      : "- none";
+
+    const queueSummary = await this.pendingQueueSummary();
+    const gates = await this.pendingGateSummary(input);
+
+    return [
+      "Active roots:",
+      activeRoots,
+      "",
+      "Last index run:",
+      lastIndexRun,
+      "",
+      "Stale index warnings:",
+      staleWarningLines,
+      "",
+      "Pending reindex queue:",
+      queueSummary,
+      "",
+      "Pending validation and impact gates:",
+      gates,
+    ].join("\n");
+  }
+
+  private async appendJsonl(filePath: string, entry: object): Promise<void> {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, `${stableStringify(entry)}\n`, {
+      flag: "a",
+      encoding: "utf8",
+    });
+  }
+
+  private async lastIndexRunSummary(): Promise<string> {
+    const runs = await this.readRecentJsonlEntries<IndexRunEntry>(this.indexRunsLogPath, 40);
+    const last = runs.at(-1);
+    if (!last) {
+      return existsSync(this.indexRunsLogPath)
+        ? `- ${this.indexRunsLogPath} has no completed runs yet`
+        : `- missing index run log at ${this.indexRunsLogPath}`;
+    }
+    const roots = Array.isArray(last.roots) && last.roots.length ? last.roots.join(", ") : "unknown roots";
+    const finished = last.finishedAt ?? last.startedAt ?? "unknown time";
+    return `- ${finished} (${last.reason ?? "unknown reason"}; roots: ${roots})`;
+  }
+
+  private async pendingQueueSummary(): Promise<string> {
+    const entries = await this.readRecentJsonlEntries<ReindexQueueEntry>(this.reindexQueuePath, 50);
+    if (!entries.length) {
+      return existsSync(this.reindexQueuePath)
+        ? "- queue empty"
+        : `- missing reindex queue at ${this.reindexQueuePath}`;
+    }
+
+    const recent = entries.slice(-5).map((entry) => `- ${entry.ref} (${entry.reason}, dedupe=${entry.dedupeKey})`);
+    return [`- ${entries.length} recent queued item(s) sampled from ${this.reindexQueuePath}`, ...recent].join("\n");
+  }
+
+  private async pendingGateSummary(input: CompactionContextInput): Promise<string> {
+    const ledger = await this.readRecentJsonlEntries<LedgerEntry>(this.ledgerPath, 200);
+    const sessionLedger = input.sessionID
+      ? ledger.filter((entry) => entry.sessionID === input.sessionID)
+      : ledger;
+    const latestTouchAt = this.latestAt(
+      sessionLedger.filter((entry) => entry.type === "file.touched" || entry.type === "file.edited.event" || entry.type === "file.watcher.updated.event"),
+    );
+    const latestValidationAt = this.latestAt(sessionLedger.filter((entry) => entry.type === "validation.command"));
+    const latestImpactAt = this.latestAt(sessionLedger.filter((entry) => entry.type === "impact.analysis.requested"));
+
+    const contractWarnings = sessionLedger
+      .filter((entry) => entry.type === "contract.edit.warning" && typeof entry.ref === "string")
+      .map((entry) => entry.ref as string);
+    const uniqueContractWarnings = Array.from(new Set(contractWarnings)).sort((a, b) => a.localeCompare(b));
+
+    const lines: string[] = [];
+    if (input.touchedRefs.length && (!latestValidationAt || (latestTouchAt && latestValidationAt < latestTouchAt))) {
+      lines.push(`- validation pending for touched refs (${input.touchedRefs.length}) in this session; last validation ${latestValidationAt ?? "not recorded"}`);
+    } else {
+      lines.push(`- validation gate clear or not required for this session; last validation ${latestValidationAt ?? "not recorded"}`);
+    }
+
+    if (uniqueContractWarnings.length && (!latestImpactAt || (latestTouchAt && latestImpactAt < latestTouchAt))) {
+      lines.push(`- impact review pending in this session for contract refs: ${uniqueContractWarnings.join(", ")}`);
+    } else {
+      lines.push(`- impact gate clear or not required for this session; last impact analysis ${latestImpactAt ?? "not recorded"}`);
+    }
+
+    return lines.join("\n");
+  }
+
+  private latestAt(entries: Array<{ at?: string }>): string | undefined {
+    return entries
+      .map((entry) => entry.at)
+      .filter((value): value is string => typeof value === "string")
+      .sort((left, right) => left.localeCompare(right))
+      .at(-1);
+  }
+
+  private async readRecentJsonlEntries<T>(filePath: string, limit: number): Promise<T[]> {
+    if (!existsSync(filePath) || limit <= 0) return [];
+    const text = await this.readTailText(filePath, 128 * 1024);
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .flatMap((line) => {
+        try {
+          return [JSON.parse(line) as T];
+        } catch {
+          return [];
+        }
+      })
+      .slice(-limit);
+  }
+
+  private async readTailText(filePath: string, maxBytes: number): Promise<string> {
+    const handle = await open(filePath, "r");
+    try {
+      const stats = await handle.stat();
+      if (stats.size <= 0) return "";
+      const bytesToRead = Math.min(stats.size, maxBytes);
+      const start = Math.max(0, stats.size - bytesToRead);
+      const buffer = Buffer.alloc(bytesToRead);
+      const { bytesRead } = await handle.read(buffer, 0, bytesToRead, start);
+      let text = buffer.subarray(0, bytesRead).toString("utf8");
+      if (start > 0) {
+        const newlineIndex = text.indexOf("\n");
+        text = newlineIndex >= 0 ? text.slice(newlineIndex + 1) : "";
+      }
+      return text;
+    } finally {
+      await handle.close();
+    }
+  }
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(normalizeJsonValue(value));
+}
+
+function normalizeJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => normalizeJsonValue(item));
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => [key, normalizeJsonValue(item)]);
+    return Object.fromEntries(entries);
+  }
+  return value;
 }

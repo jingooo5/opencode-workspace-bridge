@@ -8,9 +8,15 @@ export function createCompactionHook(store: WorkspaceStore, sessions: SessionSta
       const workspace = await store.workspaceSummary().catch(() => "Context Bridge manifest unavailable.");
       const touched = sessions.touched(input.sessionID);
       const ledger = await store.recentLedger(12);
+      const compactionContext = await store.compactionContext({
+        sessionID: input.sessionID,
+        touchedRefs: touched,
+      });
       output.context.push(`
 ## Context Bridge durable state
 ${workspace}
+
+${compactionContext}
 
 Touched refs in this session:
 ${touched.length ? touched.map((ref) => `- ${ref}`).join("\n") : "- none recorded"}

@@ -4,9 +4,20 @@ import { mkdir, readFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { RootRoleSchema, type ContextBridgeOptions } from "../types.js";
-import type { IndexEntry } from "../types.js";
+import type { IndexEntry, SearchHit } from "../types.js";
 import type { WorkspaceStore } from "../state/workspace-store.js";
 import { indexRoot, readEntries, searchIndex } from "../indexer/light-index.js";
+import {
+  openSQLiteIndexStore,
+  type DebugIndexRunRecord,
+  type DebugEdgeRecord,
+  type DebugNodeRecord,
+  type DebugSnapshot,
+  type DebugSpanRecord,
+  type DebugUnresolvedRecord,
+  type StorageDiagnostic,
+} from "../indexer/sqlite-store.js";
+import { INDEX_SCHEMA_VERSION } from "../indexer/schema.js";
 
 // Use the plugin's own zod instance so schemas are guaranteed compatible with
 // the runtime that ultimately consumes tool definitions.
@@ -93,7 +104,17 @@ export function createContextTools(
           const entries = await indexRoot(store, root);
           result.push({ root: root.name, entries: entries.length });
         }
-        return JSON.stringify({ index: store.indexPath, result }, null, 2);
+        const sqlite = await readSQLiteToolEvidence(store);
+        return JSON.stringify(
+          {
+            index: store.indexPath,
+            result,
+            sqlite: sqliteReport(sqlite),
+            latestIndexRun: latestIndexRun(sqlite.snapshot) ?? null,
+          },
+          null,
+          2,
+        );
       },
     }),
 
@@ -110,13 +131,18 @@ export function createContextTools(
       },
       async execute(args) {
         await ensureIndexReady(store, options);
-        const hits = await searchIndex(
-          store,
-          args.query,
-          args.roots,
-          args.limit ?? options.maxSearchResults,
-        );
-        return (
+        const sqlite = await readSQLiteToolEvidence(store);
+        const sqliteEntries = sqlite.available ? sqliteIndexEntries(sqlite) : [];
+        const usingFallback = sqliteEntries.length === 0;
+        const hits = sqliteEntries.length
+          ? searchEntries(sqliteEntries, args.query, args.roots, args.limit ?? options.maxSearchResults)
+          : await searchIndex(
+              store,
+              args.query,
+              args.roots,
+              args.limit ?? options.maxSearchResults,
+            );
+        const rendered = (
           hits
             .map(
               (hit) =>
@@ -125,6 +151,8 @@ export function createContextTools(
             .join("\n\n") ||
           "No hits. Try ctx_index first or broaden the query."
         );
+        const banner = sqliteSearchBanner(sqlite, usingFallback);
+        return banner ? `${banner}\n\n${rendered}` : rendered;
       },
     }),
 
@@ -137,6 +165,7 @@ export function createContextTools(
       async execute(args) {
         const manifest = await store.readManifest();
         const entries = await readEntries(store.indexPath);
+        const sqlite = await readSQLiteToolEvidence(store);
         const recent = await store.recentLedger(args.ledgerLimit ?? 8);
         const countsByKind = countBy(entries, (entry) => entry.kind);
         const countsByRoot = countBy(entries, (entry) => entry.root);
@@ -166,10 +195,13 @@ export function createContextTools(
               countsByRoot,
               staleRoots,
             },
+            sqlite: sqliteStatus(sqlite),
             recentLedger: recent.map(parseLedgerLine),
             notes: [
-              "Status uses only the current manifest, JSONL index, and recent ledger.",
-              "V0.1 does not track import graphs, semantic memory, or structural dependencies.",
+              sqlite.available
+                ? "Status includes SQLite-backed evidence plus the legacy JSONL compatibility index."
+                : "SQLite evidence is unavailable; status is degraded to manifest, JSONL index, and recent ledger.",
+              "SQLite graph facts are conservative evidence, not semantic memory or complete structural proof.",
             ],
           },
           null,
@@ -189,8 +221,11 @@ export function createContextTools(
       },
       async execute(args) {
         await ensureIndexReady(store, options);
-        const entries = (await readEntries(store.indexPath))
-          .filter((entry) => entry.kind === "symbol")
+        const sqlite = await readSQLiteToolEvidence(store);
+        const sourceEntries = sqlite.available && sqliteSymbolEntries(sqlite).length > 0
+          ? sqliteSymbolEntries(sqlite)
+          : (await readEntries(store.indexPath)).filter((entry) => entry.kind === "symbol");
+        const entries = sourceEntries
           .filter((entry) => !args.root || entry.root === args.root)
           .filter((entry) => !args.ref || entry.ref === args.ref)
           .filter((entry) => matchesSymbolQuery(entry, args.query))
@@ -221,8 +256,12 @@ export function createContextTools(
             },
             count: entries.length,
             symbols: entries,
+            sqlite: sqliteReport(sqlite),
             notes: [
-              "Symbols come from lightweight text extraction, not AST or LSP graph analysis.",
+              sqlite.available
+                ? "Symbols come from SQLite-backed lightweight extraction evidence."
+                : "SQLite symbols are unavailable; symbols come from legacy JSONL extraction evidence.",
+              "Symbol evidence is lightweight extraction, not LSP graph analysis.",
             ],
           },
           null,
@@ -240,8 +279,10 @@ export function createContextTools(
       },
       async execute(args) {
         await ensureIndexReady(store, options);
-        const entries = await readEntries(store.indexPath);
-        const analysis = await collectNeighbors(store, entries, args.target, args.limit ?? 20);
+        const sqlite = await readSQLiteToolEvidence(store);
+        const sqliteEntries = sqlite.available ? sqliteIndexEntries(sqlite) : [];
+        const entries = sqliteEntries.length ? sqliteEntries : await readEntries(store.indexPath);
+        const analysis = await collectNeighbors(store, entries, args.target, args.limit ?? 20, sqlite);
         return JSON.stringify(analysis, null, 2);
       },
     }),
@@ -286,11 +327,13 @@ export function createContextTools(
       },
       async execute(args) {
         await ensureIndexReady(store, options);
+        const sqlite = await readSQLiteToolEvidence(store);
         const pack = await createPack(
           store,
           args.task,
           args.roots,
           args.limit ?? 12,
+          sqlite,
         );
         return JSON.stringify(pack, null, 2);
       },
@@ -307,8 +350,10 @@ export function createContextTools(
       },
       async execute(args) {
         await ensureIndexReady(store, options);
-        const entries = await readEntries(store.indexPath);
-        const plan = await buildTestPlan(store, entries, args);
+        const sqlite = await readSQLiteToolEvidence(store);
+        const sqliteEntries = sqlite.available ? sqliteIndexEntries(sqlite) : [];
+        const entries = sqliteEntries.length ? sqliteEntries : await readEntries(store.indexPath);
+        const plan = await buildTestPlan(store, entries, args, sqlite);
         return JSON.stringify(plan, null, 2);
       },
     }),
@@ -347,11 +392,13 @@ export function createContextTools(
         let refreshedPack: Record<string, unknown> | undefined;
         if (args.task) {
           await ensureIndexReady(store, options);
+          const sqlite = await readSQLiteToolEvidence(store);
           refreshedPack = await createPack(
             store,
             args.task,
             args.root ? [args.root] : undefined,
             args.limit ?? 12,
+            sqlite,
           );
           actions.pack = {
             task: args.task,
@@ -398,12 +445,17 @@ export function createContextTools(
       },
       async execute(args) {
         await ensureIndexReady(store, options);
-        const hits = await searchIndex(
-          store,
-          args.target,
-          undefined,
-          args.limit ?? 30,
-        );
+        const sqlite = await readSQLiteToolEvidence(store);
+        const sqliteEntries = sqlite.available ? sqliteIndexEntries(sqlite) : [];
+        const hits = sqliteEntries.length
+          ? searchEntries(sqliteEntries, args.target, undefined, args.limit ?? 30)
+          : await searchIndex(
+              store,
+              args.target,
+              undefined,
+              args.limit ?? 30,
+            );
+        const graphImpact = graphImpactForTarget(sqlite, args.target, args.limit ?? 30);
         const risks = inferRisks(
           args.target,
           hits.map((hit) => hit.path),
@@ -421,11 +473,18 @@ export function createContextTools(
             target: args.target,
             roots,
             directEvidence: hits,
+            graphDirectEvidence: graphImpact.directEvidence,
+            crossRootEvidence: graphImpact.crossRootEvidence,
+            unknownEvidence: graphImpact.unknownEvidence,
+            testCandidateEvidence: graphImpact.testCandidateEvidence,
+            graphWarnings: graphImpact.warnings,
+            sqlite: sqliteReport(sqlite),
             risks,
-            unknowns: [
+            unknowns: dedupeStrings([
               "V0.1 uses lightweight text/symbol evidence; REST/OpenAPI/proto structural matching arrives in v0.2+.",
               "Low or missing evidence should be confirmed with ctx_read and targeted search.",
-            ],
+              ...graphImpact.unknowns,
+            ]),
             suggestedNext: [
               "Create a ctx_pack for the concrete task.",
               "Delegate to ctx-impact-analyst for edit order.",
@@ -446,17 +505,27 @@ async function createPack(
   task: string,
   roots: string[] | undefined,
   limit: number,
+  sqlite?: SQLiteToolEvidence,
 ): Promise<Record<string, unknown>> {
-  const hits = await searchIndex(store, task, roots, limit);
+  const sqliteEvidence = sqlite ?? await readSQLiteToolEvidence(store);
+  const sqliteEntries = sqliteEvidence.available ? sqliteIndexEntries(sqliteEvidence) : [];
+  const hits = sqliteEntries.length
+    ? searchEntries(sqliteEntries, task, roots, limit)
+    : await searchIndex(store, task, roots, limit);
   const summary = await store.workspaceSummary();
   const riskHints = inferRisks(
     task,
     hits.map((hit) => hit.path),
   );
+  const graph = graphPackEvidence(sqliteEvidence, task, roots, limit, hits);
   const pack = {
     task,
     workspace: summary,
     evidence: hits,
+    graph,
+    evidenceAnchors: graph.evidenceAnchors,
+    unknowns: graph.unknowns,
+    warnings: graph.warnings,
     risks: riskHints,
     suggestedNext: [
       "Inspect the top evidence refs with ctx_read.",
@@ -501,6 +570,254 @@ async function ensureIndexReady(
     if (indexMissing || root.stale || !root.indexedAt)
       await indexRoot(store, root);
   }
+}
+
+interface SQLiteToolEvidence {
+  available: boolean;
+  path: string;
+  schemaVersion: number;
+  degraded: boolean;
+  diagnostics: StorageDiagnostic[];
+  snapshot?: DebugSnapshot;
+  reason?: string;
+}
+
+async function readSQLiteToolEvidence(store: WorkspaceStore): Promise<SQLiteToolEvidence> {
+  const lockDiagnostic = activeIndexLockDiagnostic(store.sqlitePath);
+  if (!existsSync(store.sqlitePath)) {
+    return {
+      available: false,
+      path: store.sqlitePath,
+      schemaVersion: INDEX_SCHEMA_VERSION,
+      degraded: true,
+      diagnostics: [
+        ...(lockDiagnostic ? [lockDiagnostic] : []),
+        {
+          level: "warn",
+          code: "sqlite.missing",
+          message: "SQLite index is missing; using legacy JSONL fallback where available.",
+          path: store.sqlitePath,
+        },
+      ],
+      reason: "missing",
+    };
+  }
+
+  const opened = await openSQLiteIndexStore(store.sqlitePath, { readonly: true, skipMigrations: true });
+  if (!opened.ok) {
+    return {
+      available: false,
+      path: store.sqlitePath,
+      schemaVersion: INDEX_SCHEMA_VERSION,
+      degraded: true,
+      diagnostics: [...(lockDiagnostic ? [lockDiagnostic] : []), ...opened.diagnostics],
+      reason: "open_failed",
+    };
+  }
+
+  const snapshot = opened.value.readDebugSnapshot();
+  const close = opened.value.close();
+  const diagnostics = [
+    ...(lockDiagnostic ? [lockDiagnostic] : []),
+    ...opened.diagnostics,
+    ...snapshot.diagnostics,
+    ...close.diagnostics,
+  ];
+  if (!snapshot.ok) {
+    return {
+      available: false,
+      path: store.sqlitePath,
+      schemaVersion: INDEX_SCHEMA_VERSION,
+      degraded: true,
+      diagnostics,
+      reason: "snapshot_failed",
+    };
+  }
+
+  return {
+    available: true,
+    path: store.sqlitePath,
+    schemaVersion: INDEX_SCHEMA_VERSION,
+    degraded: !!opened.degraded || diagnostics.some((item) => item.level !== "info"),
+    diagnostics,
+    snapshot: snapshot.value,
+  };
+}
+
+function sqliteReport(sqlite: SQLiteToolEvidence): Record<string, unknown> {
+  return {
+    path: sqlite.path,
+    available: sqlite.available,
+    degraded: sqlite.degraded,
+    schemaVersion: sqlite.schemaVersion,
+    reason: sqlite.reason ?? null,
+    diagnostics: diagnosticCounts(sqlite.diagnostics),
+    diagnosticDetails: sqlite.diagnostics,
+    counts: sqlite.snapshot ? sqliteSnapshotCounts(sqlite.snapshot) : null,
+  };
+}
+
+function sqliteStatus(sqlite: SQLiteToolEvidence): Record<string, unknown> {
+  return {
+    ...sqliteReport(sqlite),
+    latestIndexRun: latestIndexRun(sqlite.snapshot) ?? null,
+  };
+}
+
+function sqliteSearchBanner(sqlite: SQLiteToolEvidence, usingFallback: boolean): string | undefined {
+  const codes = dedupeStrings(sqlite.diagnostics.filter((item) => item.level !== "info").map((item) => item.code));
+  const detail = codes.join(", ") || sqlite.reason || "unknown";
+  if (!sqlite.available) {
+    return `SQLite unavailable (${detail}); using legacy JSONL fallback.`;
+  }
+  if (usingFallback) {
+    return `SQLite search evidence is empty or incomplete; using legacy JSONL fallback${codes.length ? ` (${detail})` : ""}.`;
+  }
+  if (sqlite.degraded) {
+    return `SQLite opened with diagnostics (${detail}); results may be incomplete.`;
+  }
+  return undefined;
+}
+
+function activeIndexLockDiagnostic(sqlitePath: string): StorageDiagnostic | undefined {
+  const lockPath = `${sqlitePath}.lock`;
+  if (!existsSync(lockPath)) return undefined;
+  return {
+    level: "warn",
+    code: "sqlite.index_in_progress",
+    message: "An index writer is currently active; reads may use the last readable snapshot or fallback output.",
+    path: lockPath,
+  };
+}
+
+function sqliteSnapshotCounts(snapshot: DebugSnapshot): Record<string, unknown> {
+  return {
+    nodes: snapshot.nodes.length,
+    edges: snapshot.edges.length,
+    spans: snapshot.spans.length,
+    unresolved: snapshot.unresolved.length,
+    indexRuns: snapshot.indexRuns.length,
+    nodesByKind: countBy(snapshot.nodes, (node) => node.kind),
+    nodesByRoot: countBy(snapshot.nodes, (node) => node.rootName),
+  };
+}
+
+function latestIndexRun(snapshot?: DebugSnapshot): DebugIndexRunRecord | undefined {
+  return snapshot?.indexRuns
+    .slice()
+    .sort((left, right) => (left.finishedAt ?? left.startedAt).localeCompare(right.finishedAt ?? right.startedAt))
+    .at(-1);
+}
+
+function diagnosticCounts(diagnostics: StorageDiagnostic[]): Record<string, number> {
+  return {
+    info: diagnostics.filter((item) => item.level === "info").length,
+    warn: diagnostics.filter((item) => item.level === "warn").length,
+    error: diagnostics.filter((item) => item.level === "error").length,
+  };
+}
+
+function sqliteIndexEntries(sqlite: SQLiteToolEvidence): IndexEntry[] {
+  const snapshot = sqlite.snapshot;
+  if (!snapshot) return [];
+  const spans = spansByFileKindLine(snapshot.spans);
+  const updatedAt = latestIndexRun(snapshot)?.finishedAt ?? latestIndexRun(snapshot)?.startedAt ?? "sqlite";
+  const entries = new Map<string, IndexEntry>();
+
+  for (const node of snapshot.nodes) {
+    const entry = sqliteNodeToIndexEntry(node, spans, updatedAt);
+    if (!entry) continue;
+    const key = `${entry.kind}:${entry.ref}:${entry.line ?? 0}:${entry.name}`;
+    entries.set(key, entry);
+  }
+
+  return Array.from(entries.values()).sort((left, right) =>
+    `${left.root}:${left.path}:${left.kind}:${left.name}:${left.line ?? 0}`.localeCompare(
+      `${right.root}:${right.path}:${right.kind}:${right.name}:${right.line ?? 0}`,
+    ),
+  );
+}
+
+function sqliteSymbolEntries(sqlite: SQLiteToolEvidence): IndexEntry[] {
+  return sqliteIndexEntries(sqlite).filter((entry) => entry.kind === "symbol");
+}
+
+function spansByFileKindLine(spans: DebugSpanRecord[]): Map<string, DebugSpanRecord> {
+  const out = new Map<string, DebugSpanRecord>();
+  for (const span of spans) {
+    if (!span.fileId || !span.kind) continue;
+    out.set(sqliteSpanKey(span.fileId, span.kind, span.startLine), span);
+  }
+  return out;
+}
+
+function sqliteNodeToIndexEntry(
+  node: DebugNodeRecord,
+  spans: Map<string, DebugSpanRecord>,
+  updatedAt: string,
+): IndexEntry | undefined {
+  const pathValue = node.relPath ?? stringAttr(node.attrs, "relPath");
+  if (!pathValue || !node.rootName) return undefined;
+  const kind = sqliteNodeKindToIndexKind(node.kind, pathValue);
+  const span = node.fileId ? spans.get(sqliteSpanKey(node.fileId, node.kind, node.startLine)) : undefined;
+  return {
+    root: node.rootName,
+    ref: `${node.rootName}:${pathValue}`,
+    path: pathValue,
+    kind,
+    name: node.name,
+    line: kind === "file" ? undefined : node.startLine,
+    text: span?.text,
+    updatedAt,
+  };
+}
+
+function sqliteNodeKindToIndexKind(kind: string, relPath: string): IndexEntry["kind"] {
+  if (kind === "FILE") return isContractRelPath(relPath) ? "contract" : "file";
+  if (kind === "PACKAGE") return "package";
+  if (kind === "HTTP_ROUTE_CANDIDATE") return "route";
+  if (kind === "TEST_CANDIDATE") return "test";
+  return "symbol";
+}
+
+function sqliteSpanKey(fileId: string, kind: string, startLine: number): string {
+  return `${fileId}:${kind}:${startLine}`;
+}
+
+function stringAttr(attrs: Record<string, unknown>, key: string): string | undefined {
+  const value = attrs[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function isContractRelPath(relPath: string): boolean {
+  return /(^|\/)(openapi|schema)\.(ya?ml|json|graphql|prisma)$/.test(relPath) || /\.proto$/.test(relPath) || /migrations\//.test(relPath);
+}
+
+function searchEntries(entries: IndexEntry[], query: string, roots: string[] | undefined, limit: number): SearchHit[] {
+  const q = query.toLowerCase();
+  const allowed = new Set(roots ?? []);
+  const hits: SearchHit[] = [];
+  for (const entry of entries) {
+    if (allowed.size && !allowed.has(entry.root)) continue;
+    const haystack = `${entry.name}\n${entry.path}\n${entry.text ?? ""}`.toLowerCase();
+    if (!haystack.includes(q)) continue;
+    const name = entry.name.toLowerCase();
+    const score = name === q ? 10 : name.includes(q) ? 6 : entry.path.toLowerCase().includes(q) ? 4 : 1;
+    hits.push({
+      root: entry.root,
+      ref: entry.ref,
+      path: entry.path,
+      line: entry.line,
+      kind: entry.kind,
+      score,
+      text: entry.text ?? entry.name,
+    });
+  }
+  return hits.sort((left, right) => bScore(left, right)).slice(0, limit);
+}
+
+function bScore(left: SearchHit, right: SearchHit): number {
+  return right.score - left.score || left.ref.localeCompare(right.ref) || (left.line ?? 0) - (right.line ?? 0);
 }
 
 function inferRisks(task: string, paths: string[]): string[] {
@@ -554,6 +871,7 @@ async function collectNeighbors(
   entries: IndexEntry[],
   target: string,
   limit: number,
+  sqlite?: SQLiteToolEvidence,
 ): Promise<Record<string, unknown>> {
   const resolved = await store.resolveRef(target);
   const direct = entries.filter(
@@ -613,12 +931,15 @@ async function collectNeighbors(
       reasons,
     }));
 
+  const graph = graphNeighborsForTarget(sqlite, target, limit);
   return {
     version: "v0.1",
     target,
     heuristic: true,
     disclaimer:
-      "Neighbors are heuristic only: same-file, same-name, same-directory, and ref-related matches from the lightweight index. No structural graph proof is available in V0.1.",
+      sqlite?.available
+        ? "Neighbors include graph-backed SQLite edges plus legacy same-file, same-name, same-directory, and ref-related heuristic matches."
+        : "Neighbors are heuristic only: same-file, same-name, same-directory, and ref-related matches from the lightweight index. SQLite graph evidence is unavailable.",
     directEvidence: direct.map((entry) => ({
       root: entry.root,
       ref: entry.ref,
@@ -629,24 +950,405 @@ async function collectNeighbors(
       text: entry.text ?? null,
     })),
     neighbors,
-    unknowns: [
-      "Import/call relationships are not tracked in the V0.1 index.",
+    graphDirectEvidence: graph.directEvidence,
+    graphNeighbors: graph.neighbors,
+    graphUnknowns: graph.unknowns,
+    graphWarnings: graph.warnings,
+    sqlite: sqlite ? sqliteReport(sqlite) : null,
+    unknowns: dedupeStrings([
+      sqlite?.available
+        ? "Graph relationships are conservative SQLite evidence and may still be incomplete."
+        : "Import/call relationships require SQLite graph evidence and are unavailable in this degraded response.",
       "Low-confidence neighbors should be confirmed with ctx_read or ctx_search.",
-    ],
+      ...graph.unknowns,
+    ]),
   };
+}
+
+interface GraphAnchor {
+  id: string;
+  kind: string;
+  name: string;
+  root: string;
+  ref: string | null;
+  path: string | null;
+  line: number | null;
+  confidence: number;
+}
+
+interface GraphEdgeEvidence {
+  id: string;
+  kind: string;
+  from: GraphAnchor | null;
+  to: GraphAnchor | null;
+  source: GraphAnchor | null;
+  confidence: number;
+  attrs: Record<string, unknown>;
+}
+
+function graphNeighborsForTarget(sqlite: SQLiteToolEvidence | undefined, target: string, limit: number): {
+  directEvidence: GraphAnchor[];
+  neighbors: GraphEdgeEvidence[];
+  unknowns: string[];
+  warnings: string[];
+} {
+  const empty = emptyGraphResult(sqlite, "SQLite graph evidence is unavailable; using legacy heuristic neighbors only.");
+  const snapshot = sqlite?.snapshot;
+  if (!sqlite?.available || !snapshot) return empty;
+  const graph = graphMaps(snapshot);
+  const matched = matchingNodes(snapshot.nodes, target);
+  const matchedIds = new Set(matched.map((node) => node.id));
+  const fileIds = new Set(matched.flatMap((node) => (node.fileId ? [node.fileId] : [])));
+  const relPaths = new Set(matched.flatMap((node) => (node.relPath ? [node.relPath] : [])));
+  const edges = snapshot.edges
+    .filter((edge) => edgeMatchesTarget(edge, matchedIds, fileIds, relPaths, target))
+    .slice(0, limit);
+  const unknownRecords = snapshot.unresolved.filter((item) => unresolvedMatches(item, matchedIds, fileIds, relPaths, target)).slice(0, limit);
+  const warnings = graphWarnings(sqlite, matched.length, edges.length, unknownRecords.length);
+  return {
+    directEvidence: matched.slice(0, limit).map(nodeToAnchor),
+    neighbors: edges.map((edge) => edgeToEvidence(edge, graph)),
+    unknowns: unknownRecords.map(unresolvedMessage),
+    warnings,
+  };
+}
+
+function graphPackEvidence(sqlite: SQLiteToolEvidence, task: string, roots: string[] | undefined, limit: number, hits: SearchHit[]): Record<string, unknown> {
+  const snapshot = sqlite.snapshot;
+  const allowedRoots = new Set(roots ?? []);
+  const hitRefs = new Set(hits.map((hit) => hit.ref));
+  if (!sqlite.available || !snapshot) {
+    return {
+      sqlite: sqliteReport(sqlite),
+      evidenceAnchors: hits.map(hitToAnchor),
+      graphNeighbors: [],
+      packages: [],
+      testCandidates: [],
+      unresolved: [],
+      unknowns: ["SQLite graph evidence is unavailable; pack evidence is degraded to legacy index hits."],
+      warnings: graphWarnings(sqlite, hits.length, 0, 0),
+    };
+  }
+  const graph = graphMaps(snapshot);
+  const taskMatches = matchingNodes(snapshot.nodes, task).filter((node) => !allowedRoots.size || allowedRoots.has(node.rootName));
+  const matchedIds = new Set(taskMatches.map((node) => node.id));
+  const hitPaths = new Set(hits.map((hit) => hit.path));
+  const relatedEdges = snapshot.edges
+    .filter((edge) => edgeMatchesPack(edge, matchedIds, hitPaths, hitRefs, allowedRoots, graph))
+    .slice(0, limit);
+  const unresolved = snapshot.unresolved
+    .filter((item) => (!allowedRoots.size || allowedRoots.has(item.rootName)) && (matchesText(`${item.name}\n${item.reason}\n${item.relPath ?? ""}`, task) || (item.relPath ? hitPaths.has(item.relPath) : false)))
+    .slice(0, limit);
+  const packages = snapshot.nodes
+    .filter((node) => node.kind === "PACKAGE" && (!allowedRoots.size || allowedRoots.has(node.rootName)))
+    .slice(0, limit)
+    .map(packageNodeSummary);
+  const testCandidates = snapshot.nodes
+    .filter((node) => node.kind === "TEST_CANDIDATE" && (!allowedRoots.size || allowedRoots.has(node.rootName)))
+    .filter((node) => taskMatches.length === 0 || relatedEdges.some((edge) => edge.fromId === node.id || edge.toId === node.id || edge.fileId === node.fileId))
+    .slice(0, limit)
+    .map(nodeToAnchor);
+  const warnings = graphWarnings(sqlite, taskMatches.length + hits.length, relatedEdges.length, unresolved.length);
+  return {
+    sqlite: sqliteReport(sqlite),
+    evidenceAnchors: dedupeAnchors([...hits.map(hitToAnchor), ...taskMatches.map(nodeToAnchor)]).slice(0, limit),
+    graphNeighbors: relatedEdges.map((edge) => edgeToEvidence(edge, graph)),
+    packages,
+    testCandidates,
+    unresolved: unresolved.map(unresolvedSummary),
+    unknowns: dedupeStrings([
+      ...unresolved.map(unresolvedMessage),
+      ...(relatedEdges.length === 0 ? ["No graph edges matched the task evidence; inspect refs before assuming cross-root impact."] : []),
+    ]),
+    warnings,
+  };
+}
+
+function graphImpactForTarget(sqlite: SQLiteToolEvidence, target: string, limit: number): {
+  directEvidence: GraphAnchor[];
+  crossRootEvidence: GraphEdgeEvidence[];
+  unknownEvidence: Array<Record<string, unknown>>;
+  testCandidateEvidence: GraphEdgeEvidence[];
+  unknowns: string[];
+  warnings: string[];
+} {
+  const snapshot = sqlite.snapshot;
+  if (!sqlite.available || !snapshot) {
+    return {
+      directEvidence: [],
+      crossRootEvidence: [],
+      unknownEvidence: [],
+      testCandidateEvidence: [],
+      unknowns: ["SQLite graph evidence is unavailable; impact analysis is degraded to legacy search hits."],
+      warnings: graphWarnings(sqlite, 0, 0, 0),
+    };
+  }
+  const graph = graphMaps(snapshot);
+  const matched = matchingNodes(snapshot.nodes, target);
+  const matchedIds = new Set(matched.map((node) => node.id));
+  const fileIds = new Set(matched.flatMap((node) => (node.fileId ? [node.fileId] : [])));
+  const relPaths = new Set(matched.flatMap((node) => (node.relPath ? [node.relPath] : [])));
+  const edges = snapshot.edges.filter((edge) => edgeMatchesTarget(edge, matchedIds, fileIds, relPaths, target));
+  const crossRoot = edges.filter((edge) => {
+    const fromRoot = edge.fromId ? graph.nodes.get(edge.fromId)?.rootName : undefined;
+    const toRoot = edge.toId ? graph.nodes.get(edge.toId)?.rootName : undefined;
+    return !!fromRoot && !!toRoot && fromRoot !== toRoot;
+  });
+  const testEdges = edges.filter((edge) => edge.kind === "TESTS" || (edge.fromId ? graph.nodes.get(edge.fromId)?.kind === "TEST_CANDIDATE" : false));
+  const unresolved = snapshot.unresolved.filter((item) => unresolvedMatches(item, matchedIds, fileIds, relPaths, target)).slice(0, limit);
+  return {
+    directEvidence: matched.slice(0, limit).map(nodeToAnchor),
+    crossRootEvidence: crossRoot.slice(0, limit).map((edge) => edgeToEvidence(edge, graph)),
+    unknownEvidence: unresolved.map(unresolvedSummary),
+    testCandidateEvidence: testEdges.slice(0, limit).map((edge) => edgeToEvidence(edge, graph)),
+    unknowns: unresolved.map(unresolvedMessage),
+    warnings: graphWarnings(sqlite, matched.length, edges.length, unresolved.length),
+  };
+}
+
+function graphTestPlanEvidence(sqlite: SQLiteToolEvidence | undefined, args: { target?: string; root?: string; ref?: string }, limit: number): {
+  testAnchors: GraphAnchor[];
+  testEdges: GraphEdgeEvidence[];
+  packages: Array<Record<string, unknown>>;
+  unknowns: string[];
+  warnings: string[];
+} {
+  const snapshot = sqlite?.snapshot;
+  if (!sqlite?.available || !snapshot) {
+    return {
+      testAnchors: [],
+      testEdges: [],
+      packages: [],
+      unknowns: ["SQLite graph evidence is unavailable; test plan uses legacy indexed test/package entries."],
+      warnings: graphWarnings(sqlite, 0, 0, 0),
+    };
+  }
+  const graph = graphMaps(snapshot);
+  const focus = args.ref ?? args.target ?? "";
+  const allowedRoot = args.root;
+  const matched = focus ? matchingNodes(snapshot.nodes, focus) : [];
+  const matchedIds = new Set(matched.map((node) => node.id));
+  const matchedFiles = new Set(matched.flatMap((node) => (node.fileId ? [node.fileId] : [])));
+  const testEdges = snapshot.edges
+    .filter((edge) => edge.kind === "TESTS")
+    .filter((edge) => !allowedRoot || edge.rootName === allowedRoot)
+    .filter((edge) => matchedIds.size === 0 || (edge.toId ? matchedIds.has(edge.toId) : false) || (edge.fileId ? matchedFiles.has(edge.fileId) : false))
+    .slice(0, limit);
+  const edgeTestIds = new Set(testEdges.flatMap((edge) => (edge.fromId ? [edge.fromId] : [])));
+  const directTests = snapshot.nodes
+    .filter((node) => node.kind === "TEST_CANDIDATE")
+    .filter((node) => !allowedRoot || node.rootName === allowedRoot)
+    .filter((node) => edgeTestIds.has(node.id) || !focus || matchesText(`${node.name}\n${node.relPath ?? ""}`, focus))
+    .slice(0, limit);
+  const packageNodes = snapshot.nodes
+    .filter((node) => node.kind === "PACKAGE")
+    .filter((node) => !allowedRoot || node.rootName === allowedRoot)
+    .slice(0, limit);
+  const unresolved = snapshot.unresolved
+    .filter((item) => item.kind === "TEST_SOURCE" || item.reason.includes("test"))
+    .filter((item) => !allowedRoot || item.rootName === allowedRoot)
+    .slice(0, limit);
+  return {
+    testAnchors: dedupeAnchors([...directTests.map(nodeToAnchor), ...testEdges.flatMap((edge) => edge.fromId ? [anchorForNodeId(graph, edge.fromId)].filter((anchor): anchor is GraphAnchor => anchor !== null) : [])]),
+    testEdges: testEdges.map((edge) => edgeToEvidence(edge, graph)),
+    packages: packageNodes.map(packageNodeSummary),
+    unknowns: unresolved.map(unresolvedMessage),
+    warnings: graphWarnings(sqlite, directTests.length, testEdges.length, unresolved.length),
+  };
+}
+
+function emptyGraphResult(sqlite: SQLiteToolEvidence | undefined, message: string): {
+  directEvidence: GraphAnchor[];
+  neighbors: GraphEdgeEvidence[];
+  unknowns: string[];
+  warnings: string[];
+} {
+  return { directEvidence: [], neighbors: [], unknowns: [message], warnings: graphWarnings(sqlite, 0, 0, 0) };
+}
+
+function graphMaps(snapshot: DebugSnapshot): { nodes: Map<string, DebugNodeRecord> } {
+  return { nodes: new Map(snapshot.nodes.map((node) => [node.id, node])) };
+}
+
+function matchingNodes(nodes: DebugNodeRecord[], target: string): DebugNodeRecord[] {
+  const normalized = target.toLowerCase();
+  return nodes.filter((node) => {
+    const ref = node.relPath && node.rootName ? `${node.rootName}:${node.relPath}` : "";
+    return node.id === target || ref === target || node.name === target || matchesText(`${node.name}\n${ref}\n${node.relPath ?? ""}`, normalized);
+  });
+}
+
+function edgeMatchesTarget(edge: DebugEdgeRecord, nodeIds: Set<string>, fileIds: Set<string>, relPaths: Set<string>, target: string): boolean {
+  return (edge.fromId ? nodeIds.has(edge.fromId) : false)
+    || (edge.toId ? nodeIds.has(edge.toId) : false)
+    || (edge.fileId ? fileIds.has(edge.fileId) : false)
+    || (edge.relPath ? relPaths.has(edge.relPath) || matchesText(edge.relPath, target) : false);
+}
+
+function edgeMatchesPack(edge: DebugEdgeRecord, nodeIds: Set<string>, hitPaths: Set<string>, hitRefs: Set<string>, roots: Set<string>, graph: { nodes: Map<string, DebugNodeRecord> }): boolean {
+  if (roots.size && edge.rootName && !roots.has(edge.rootName)) return false;
+  const from = edge.fromId ? graph.nodes.get(edge.fromId) : undefined;
+  const to = edge.toId ? graph.nodes.get(edge.toId) : undefined;
+  return (edge.fromId ? nodeIds.has(edge.fromId) : false)
+    || (edge.toId ? nodeIds.has(edge.toId) : false)
+    || (edge.relPath ? hitPaths.has(edge.relPath) || (edge.rootName ? hitRefs.has(`${edge.rootName}:${edge.relPath}`) : false) : false)
+    || (from?.relPath ? hitPaths.has(from.relPath) : false)
+    || (to?.relPath ? hitPaths.has(to.relPath) : false);
+}
+
+function unresolvedMatches(item: DebugUnresolvedRecord, nodeIds: Set<string>, fileIds: Set<string>, relPaths: Set<string>, target: string): boolean {
+  const sourceId = stringAttr(item.attrs, "nodeId") ?? stringAttr(item.attrs, "sourceUnresolvedId");
+  return (sourceId ? nodeIds.has(sourceId) : false)
+    || (item.fileId ? fileIds.has(item.fileId) : false)
+    || (item.relPath ? relPaths.has(item.relPath) || matchesText(item.relPath, target) : false)
+    || matchesText(`${item.name}\n${item.reason}`, target);
+}
+
+function nodeToAnchor(node: DebugNodeRecord): GraphAnchor {
+  const pathValue = node.relPath ?? stringAttr(node.attrs, "relPath");
+  return {
+    id: node.id,
+    kind: node.kind,
+    name: node.name,
+    root: node.rootName,
+    ref: pathValue && node.rootName ? `${node.rootName}:${pathValue}` : null,
+    path: pathValue ?? null,
+    line: node.startLine || null,
+    confidence: node.confidence,
+  };
+}
+
+function hitToAnchor(hit: SearchHit): GraphAnchor {
+  return {
+    id: `${hit.kind}:${hit.ref}:${hit.line ?? 0}:${hit.text}`,
+    kind: hit.kind,
+    name: hit.text,
+    root: hit.root,
+    ref: hit.ref,
+    path: hit.path,
+    line: hit.line ?? null,
+    confidence: Math.min(1, Math.max(0.1, hit.score / 10)),
+  };
+}
+
+function edgeToEvidence(edge: DebugEdgeRecord, graph: { nodes: Map<string, DebugNodeRecord> }): GraphEdgeEvidence {
+  const sourceNode = edge.fileId ? graph.nodes.get(`node:${edge.fileId}`) : undefined;
+  return {
+    id: edge.id,
+    kind: edge.kind,
+    from: edge.fromId ? anchorForNodeId(graph, edge.fromId) : null,
+    to: edge.toId ? anchorForNodeId(graph, edge.toId) : null,
+    source: sourceNode ? nodeToAnchor(sourceNode) : edge.relPath && edge.rootName ? {
+      id: edge.fileId ?? edge.id,
+      kind: "FILE",
+      name: path.posix.basename(edge.relPath),
+      root: edge.rootName,
+      ref: `${edge.rootName}:${edge.relPath}`,
+      path: edge.relPath,
+      line: edge.startLine ?? null,
+      confidence: edge.confidence,
+    } : null,
+    confidence: edge.confidence,
+    attrs: edge.attrs,
+  };
+}
+
+function anchorForNodeId(graph: { nodes: Map<string, DebugNodeRecord> }, id: string): GraphAnchor | null {
+  const node = graph.nodes.get(id);
+  return node ? nodeToAnchor(node) : null;
+}
+
+function unresolvedSummary(item: DebugUnresolvedRecord): Record<string, unknown> {
+  return {
+    id: item.id,
+    kind: item.kind,
+    name: item.name,
+    root: item.rootName,
+    ref: item.relPath && item.rootName ? `${item.rootName}:${item.relPath}` : null,
+    path: item.relPath ?? null,
+    reason: item.reason,
+    attrs: item.attrs,
+  };
+}
+
+function unresolvedMessage(item: DebugUnresolvedRecord): string {
+  const ref = item.relPath && item.rootName ? `${item.rootName}:${item.relPath}` : item.rootName;
+  return `${item.kind} ${item.name} unresolved at ${ref}: ${item.reason}`;
+}
+
+function packageNodeSummary(node: DebugNodeRecord): Record<string, unknown> {
+  return {
+    ...nodeToAnchor(node),
+    scripts: stringArrayAttr(node.attrs, "scripts"),
+    testScripts: stringArrayAttr(node.attrs, "testScripts"),
+    testCommands: recordAttr(node.attrs, "testCommands"),
+    dependencies: stringArrayAttr(node.attrs, "dependencies"),
+  };
+}
+
+function graphPackageCommands(packages: Array<Record<string, unknown>>): string[] {
+  return packages.flatMap((pkg) => {
+    const pathValue = typeof pkg.path === "string" ? pkg.path : undefined;
+    const testCommands = isStringRecord(pkg.testCommands) ? Object.keys(pkg.testCommands) : [];
+    const dir = pathValue ? path.posix.dirname(pathValue) : ".";
+    return testCommands.map((script) => dir === "." ? `bun run ${script}` : `bun --cwd ${JSON.stringify(dir)} run ${script}`);
+  });
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.values(value).every((item) => typeof item === "string");
+}
+
+function graphWarnings(sqlite: SQLiteToolEvidence | undefined, directCount: number, edgeCount: number, unknownCount: number): string[] {
+  const warnings: string[] = [];
+  if (!sqlite?.available) warnings.push("SQLite graph evidence unavailable; degraded fallback is in use.");
+  else if (sqlite.degraded) warnings.push("SQLite graph evidence opened with diagnostics; treat graph links as potentially incomplete.");
+  if (sqlite?.snapshot && latestIndexRun(sqlite.snapshot) === undefined) warnings.push("No completed SQLite index run was found; graph evidence may be stale.");
+  if (directCount === 0) warnings.push("No direct graph evidence matched the request.");
+  if (edgeCount === 0) warnings.push("No graph edges matched the request; cross-root links may be unknown or stale.");
+  if (unknownCount > 0) warnings.push("Unresolved graph records are present; do not treat missing links as proof of no impact.");
+  return dedupeStrings(warnings);
+}
+
+function matchesText(value: string, query: string): boolean {
+  return value.toLowerCase().includes(query.toLowerCase());
+}
+
+function stringArrayAttr(attrs: Record<string, unknown>, key: string): string[] {
+  const value = attrs[key];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function recordAttr(attrs: Record<string, unknown>, key: string): Record<string, string> {
+  const value = attrs[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+}
+
+function dedupeAnchors(anchors: GraphAnchor[]): GraphAnchor[] {
+  const seen = new Set<string>();
+  return anchors.filter((anchor) => {
+    const key = anchor.ref ? `${anchor.ref}:${anchor.kind}:${anchor.line ?? 0}:${anchor.name}` : anchor.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 async function buildTestPlan(
   store: WorkspaceStore,
   entries: IndexEntry[],
   args: { target?: string; root?: string; ref?: string; limit?: number },
+  sqlite?: SQLiteToolEvidence,
 ): Promise<Record<string, unknown>> {
   const filtered = entries.filter((entry) => !args.root || entry.root === args.root);
   const tests = filtered.filter((entry) => entry.kind === "test");
   const packages = filtered.filter((entry) => entry.kind === "package");
   const focus = args.ref ?? args.target;
+  const graphPlan = graphTestPlanEvidence(sqlite, args, args.limit ?? 20);
+  const graphTestRefs = new Set(graphPlan.testAnchors.flatMap((anchor) => (anchor.ref ? [anchor.ref] : [])));
   const candidateTests = tests
-    .filter((entry) => matchesTestFocus(entry, focus, args.ref))
+    .filter((entry) => graphTestRefs.has(entry.ref) || matchesTestFocus(entry, focus, args.ref))
     .slice(0, args.limit ?? 20);
 
   const packagePlans: Array<{
@@ -661,10 +1363,10 @@ async function buildTestPlan(
     if (pkgPlan) packagePlans.push(pkgPlan);
   }
 
+  const packageCommands = [...packagePlans.flatMap((pkg) => pkg.commands), ...graphPackageCommands(graphPlan.packages)];
   const commands = dedupeStrings([
     ...candidateTests.map((entry) => `bun test ${entry.path}`),
-    ...packagePlans.flatMap((pkg) => pkg.commands),
-    ...(candidateTests.length > 0 ? [] : ["bun test"]),
+    ...packageCommands,
   ]);
 
   return {
@@ -681,12 +1383,18 @@ async function buildTestPlan(
       path: entry.path,
       name: entry.name,
     })),
+    graphMatchingTests: graphPlan.testAnchors,
+    graphTestEdges: graphPlan.testEdges,
+    graphUnknowns: graphPlan.unknowns,
+    graphWarnings: graphPlan.warnings,
+    sqlite: sqlite ? sqliteReport(sqlite) : null,
     packages: packagePlans,
+    graphPackages: graphPlan.packages,
     suggestedCommands: commands,
     notes: [
       candidateTests.length > 0
         ? "Prefer the narrower file-level commands first, then broader package scripts if needed."
-        : "No strongly targeted test files were found in the index; broader package-level suggestions are provided when available.",
+        : "No strongly targeted test files were found in the index; only package-level indexed test scripts are suggested when available.",
     ],
   };
 }

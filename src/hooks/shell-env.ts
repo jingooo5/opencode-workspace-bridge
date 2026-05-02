@@ -7,6 +7,8 @@ export function createShellEnvHook(store: WorkspaceStore): Pick<Hooks, "shell.en
       output.env.CTX_BRIDGE_STATE_DIR = store.stateDirAbs;
       output.env.CTX_BRIDGE_MANIFEST = store.manifestPath;
       output.env.CTX_BRIDGE_INDEX = store.indexPath;
+      output.env.CTX_BRIDGE_REINDEX_QUEUE = store.reindexQueuePath;
+      output.env.CTX_BRIDGE_INDEX_RUNS_LOG = store.indexRunsLogPath;
     },
   };
 }

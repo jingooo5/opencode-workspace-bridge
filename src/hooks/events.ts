@@ -1,7 +1,7 @@
-import path from "node:path";
 import type { Hooks } from "@opencode-ai/plugin";
 import type { WorkspaceStore } from "../state/workspace-store.js";
 import { log } from "../shared/log.js";
+import { extractPath, markStaleAndQueuePath } from "./reindex.js";
 
 export function createEventHook(store: WorkspaceStore): Pick<Hooks, "event"> {
   return {
@@ -19,11 +19,20 @@ export function createEventHook(store: WorkspaceStore): Pick<Hooks, "event"> {
       if (event.type === "file.edited") {
         const file = extractPath(event.properties);
         if (file) {
-          const abs = path.isAbsolute(file)
-            ? file
-            : path.resolve(store.ctx.directory, file);
-          await store.markStaleByAbsPath(abs);
+          await markStaleAndQueuePath(store, file, "file_edited", {
+            eventType: event.type,
+          });
           await store.appendLedger({ type: "file.edited.event", file });
+        }
+      }
+
+      if (event.type === "file.watcher.updated") {
+        const file = extractPath(event.properties);
+        if (file) {
+          await markStaleAndQueuePath(store, file, "file_watcher_updated", {
+            eventType: event.type,
+          });
+          await store.appendLedger({ type: "file.watcher.updated.event", file });
         }
       }
 
@@ -42,13 +51,4 @@ export function createEventHook(store: WorkspaceStore): Pick<Hooks, "event"> {
       }
     },
   };
-}
-
-function extractPath(properties: unknown): string | undefined {
-  if (typeof properties !== "object" || properties === null) return undefined;
-  const record = properties as Record<string, unknown>;
-  for (const key of ["path", "file", "filePath", "filename"]) {
-    if (typeof record[key] === "string") return record[key] as string;
-  }
-  return undefined;
 }
